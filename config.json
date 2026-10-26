@@ -1,0 +1,17 @@
+{
+  "ollama_url": "http://localhost:11434",
+  "models": [
+    "qwen3.5:9b",
+    "qwen3.5:4b"
+  ],
+  "num_ctx": 16384,
+  "think": false,
+  "temperature_understand": 0.3,
+  "temperature_compose": 0.2,
+  "timeout_s": 600,
+  "rules_file": "rules/communication_rules.md",
+  "contexts_dir": "contexts",
+  "history_dir": "history",
+  "include_max_chars": 12000,
+  "max_questions": 5
+}
