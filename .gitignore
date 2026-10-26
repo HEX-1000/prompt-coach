@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Personal data stays on your PC
+.state.json
+history/
+contexts/*
+!contexts/_template.md
+rules/*
+!rules/README.md
+
+# Files copied in from other projects, not part of Prompt Coach
+setup_ollama.ps1
+verify_state.py
