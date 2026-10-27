@@ -4,6 +4,7 @@ __pycache__/
 
 # Personal data stays on your PC
 .state.json
+.update_backup/
 history/
 contexts/*
 !contexts/_template.md

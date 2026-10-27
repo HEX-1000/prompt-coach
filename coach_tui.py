@@ -8,6 +8,9 @@ Run:  python -B coach_tui.py      (needs: pip install textual)
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import time
 
 from rich.text import Text
@@ -22,6 +25,13 @@ from textual.widgets.option_list import Option
 import coach_core as core
 
 STATE_FILE = core.APP_DIR / ".state.json"
+
+# Sidebar ids. The general context is always the startup choice; it has no project file.
+GENERAL_KEY = "__general__"
+HEADER_KEY = "__projects_header__"
+
+# Messages from the launch-time update, shown once when the UI is up: (text, severity).
+STARTUP_NOTES: list[tuple[str, str]] = []
 
 # Quiet pastel-violet palette. One gradient only: the wordmark.
 VIOLET = "#c4b5fd"
@@ -136,6 +146,7 @@ class CoachApp(App):
     #projects {{ height: auto; max-height: 14; background: #16131f; border: none; padding: 0; }}
     #projects:focus {{ background: #1b1726; }}
     #projects > .option-list--option-highlighted {{ background: #2a2340; color: {VIOLET}; text-style: bold; }}
+    #projects > .option-list--option-disabled {{ color: {VIOLET_DIM}; text-style: bold; }}
     #project-info, #settings, #steps {{ color: {MUTED}; }}
 
     #main {{ width: 1fr; padding: 0 2; }}
@@ -197,9 +208,7 @@ class CoachApp(App):
             yield Static("", id="status")
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
-                yield Static("PROJECT", classes="label")
-                options = [Option("none", id="__none__")] + [Option(c.name, id=c.key) for c in self.contexts]
-                yield OptionList(*options, id="projects")
+                yield OptionList(*self._project_options(), id="projects")
                 yield Static("", id="project-info")
                 yield Static("SETTINGS", classes="label")
                 yield Static("", id="settings")
@@ -225,16 +234,25 @@ class CoachApp(App):
                     yield TextArea("", id="final", soft_wrap=True)
         yield Static("", id="footer")
 
+    def _project_options(self) -> list[Option]:
+        """General Context on its own at the top, then a PROJECTS heading and the context files."""
+        options = [Option("General Context", id=GENERAL_KEY)]
+        if self.contexts:
+            options.append(Option(Text("\nPROJECTS"), id=HEADER_KEY, disabled=True))
+            options += [Option(c.name, id=c.key) for c in self.contexts]
+        return options
+
     def on_mount(self) -> None:
+        # Always start in General Context; a project is picked on purpose from the list.
         projects = self.query_one("#projects", OptionList)
-        last = self.state.get("project", "__none__")
-        keys = ["__none__"] + [c.key for c in self.contexts]
-        projects.highlighted = keys.index(last) if last in keys else 0
-        self._set_context(keys[projects.highlighted])
-        projects.focus()
+        projects.highlighted = projects.get_option_index(GENERAL_KEY)
+        self._set_context(GENERAL_KEY)
+        self.query_one("#prompt", TextArea).focus()
         self.refresh_chrome()
         self.set_interval(0.25, self._tick)
         self.run_worker(self._check_ollama, thread=True, group="ping")
+        for text, severity in STARTUP_NOTES:
+            self.notify(text, severity=severity, timeout=8)
 
     # ------------------------------------------------------------------ chrome
 
@@ -307,9 +325,9 @@ class CoachApp(App):
                 info.append("\n! " + w, style=ROSE)
         else:
             info.append("no glossary: every project\nterm will be asked about", style=MUTED)
+            if not self.contexts:
+                info.append("\n\nno projects yet: copy\ncontexts/_template.md", style=MUTED)
         self.query_one("#project-info", Static).update(info)
-        self.state["project"] = key
-        save_state(self.state)
 
     @on(OptionList.OptionHighlighted, "#projects")
     def _project_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -530,8 +548,38 @@ class CoachApp(App):
             self.notify("Final prompt copied. Edit it here and press y or ctrl+y to copy again.")
 
 
+def auto_update() -> int | None:
+    """Look for a newer version before the UI starts (see coach_update.py).
+
+    Returns an exit code when an update was installed and the new copy already ran in this
+    process's place. Returns None to carry on starting this copy. Never raises."""
+    done = os.environ.get("PROMPT_COACH_UPDATED")
+    if done:  # this is the relaunch after an update
+        STARTUP_NOTES.append((f"Prompt Coach updated ({done}).", "information"))
+        return None
+    try:
+        if not core.load_config().get("auto_update", True):
+            return None
+        import coach_update
+
+        result = coach_update.check_and_update(core.APP_DIR)
+    except Exception:
+        return None
+    if result.status == "updated":
+        label = f"{result.old} to {result.new}"
+        print(f"Prompt Coach: updated {label}. Starting the new version...", flush=True)
+        env = dict(os.environ, PROMPT_COACH_UPDATED=label)
+        return subprocess.call([sys.executable, "-B", str(core.APP_DIR / "coach_tui.py")], env=env)
+    if result.status in ("failed", "skipped") and result.message:
+        STARTUP_NOTES.append((f"Update check: {result.message}. Still on {result.old}.", "warning"))
+    return None
+
+
 def main() -> None:
     core.ensure_utf8_console()
+    code = auto_update()
+    if code is not None:
+        sys.exit(code)
     CoachApp().run()
 
 
