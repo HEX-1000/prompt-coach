@@ -2,6 +2,7 @@
 
 python -B -m unittest discover -s tests
 """
+import os
 import re
 import shutil
 import subprocess
@@ -26,6 +27,11 @@ HAS_GIT = shutil.which("git") is not None
 
 def git(*args):
     return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
+
+
+def find_powershell() -> str | None:
+    """Windows PowerShell first (the installer's target), then PowerShell 7."""
+    return shutil.which("powershell") or shutil.which("pwsh")
 
 
 def is_checkout() -> bool:
@@ -70,6 +76,23 @@ class RepoHygieneTests(unittest.TestCase):
             data = path.read_bytes()
             bad = [i for i, byte in enumerate(data) if byte > 127]
             self.assertEqual(bad, [], f"{path.name} has non-ASCII bytes at offsets {bad[:5]}")
+
+    @unittest.skipUnless(find_powershell(), "PowerShell is not installed")
+    def test_shipped_powershell_scripts_parse(self):
+        # Only parses, never runs. On a Windows machine this uses Windows PowerShell 5.1, the
+        # version the installer has to work in; elsewhere it uses pwsh, which is more lenient.
+        scripts = [p for p in tracked_files() if p.suffix.lower() == ".ps1"]
+        self.assertTrue(scripts)
+        command = (
+            "$bad = 0; foreach ($f in ($env:PS_PARSE_FILES -split '\\|')) { $t = $null; $e = $null; "
+            "[void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$t, [ref]$e); "
+            "foreach ($x in $e) { $bad++; Write-Output ($f + ':' + $x.Extent.StartLineNumber + ': ' + $x.Message) } }; "
+            "exit $bad"
+        )
+        env = dict(os.environ, PS_PARSE_FILES="|".join(str(p) for p in scripts))
+        done = subprocess.run([find_powershell(), "-NoProfile", "-NonInteractive", "-Command", command],
+                              capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, ""), done.stdout + done.stderr)
 
     def test_version_is_one_line_of_numbers_separated_by_dots(self):
         data = (ROOT / "VERSION").read_bytes()
