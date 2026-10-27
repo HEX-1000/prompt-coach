@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/HEX-1000/prompt-coach/actions/workflows/tests.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/HEX-1000/prompt-coach/tests.yml?branch=main&label=tests&style=flat-square&labelColor=16131f"></a>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-c4b5fd?style=flat-square&labelColor=16131f">
   <img alt="Platform: Windows 10/11" src="https://img.shields.io/badge/platform-Windows%2010%2F11-a8e6cf?style=flat-square&labelColor=16131f">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-f6c9a8?style=flat-square&labelColor=16131f">
@@ -62,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 It creates a Python environment in `.venv` with [Textual](https://textual.textualize.io/), a Windows Terminal profile called **Prompt Coach** with its own color scheme and icon, and a desktop shortcut. Run it again if you move the folder.
 
-At the end it checks that Ollama is installed and running and that one of the models in `config.json` is downloaded. Anything missing is listed under **Before you start**, with the command to fix it. These checks only warn; the app is installed either way. Python older than 3.10 or no Python at all stops the installer, with a link to the download.
+At the end it checks that Ollama is installed and running and that one of the models in `config.json` is downloaded. Anything missing is listed under **Before you start**, with the command to fix it. These checks only warn; the app is installed either way. The installer uses the newest Python 3.10 or newer it finds: first the Python install manager's folder, then the `py` launcher, then `python` on PATH. If there is none, or the one it finds is older than 3.10, it stops with a link to the download.
 
 **5. Add a project context (optional).** Copy `contexts\_template.md` to a new file, for example `contexts\my-project.md`, and fill in the project name, a one-line description and a glossary of your own terms. The `name:` line is what the PROJECTS list shows. The coach reads the context before every run, so it knows what your abbreviations mean. Optional `include:` paths, such as a project's `CLAUDE.md`, are read fresh each time. Without any context file, General Context is all you see, and every project term gets asked about.
 
@@ -91,7 +92,8 @@ At the end it checks that Ollama is installed and running and that one of the mo
 | `coach_core.py` | shared logic: contexts, the two stages, clipboard |
 | `coach_update.py` | the launch-time update check, see [Updates](#updates) |
 | `VERSION` | the installed version, compared with the one on GitHub |
-| `tests/` | `python -B -m unittest discover -s tests` |
+| `CHANGELOG.md` | what changed in each version, newest first |
+| `tests/` | `python -B -m unittest discover -s tests`; GitHub runs them on Windows and Linux with Python 3.10 and 3.12 |
 | `prompt_coach.py` | plain terminal version, standard library only: `python -B prompt_coach.py --project my-project "your prompt"` |
 | `contexts/*.md` | one file per project; files starting with `_` are not listed |
 | `rules/` | optional writing rules, see [rules/README.md](rules/README.md) |
@@ -100,7 +102,7 @@ At the end it checks that Ollama is installed and running and that one of the mo
 
 ## Updates
 
-When the TUI starts, it reads one small file, `VERSION`, from this repository on GitHub. If the version there is newer than yours, it installs the new files and starts the new version. You see one line in the console and a notice in the app.
+When the TUI starts, it reads one small file, `VERSION`, from this repository on GitHub. If the version there is newer than yours, it installs the new files and starts the new version. You see one line in the console and a notice in the app that lists what changed, taken from [CHANGELOG.md](CHANGELOG.md). The notice shows at most 5 lines and points to the file for the rest.
 
 - Your `contexts/`, `rules/`, `history/`, `config.json` and `.state.json` are never touched. Replaced files are copied to `.update_backup/` first.
 - A ZIP download is updated from the repository ZIP. Every Python file is checked for syntax errors before anything is written.
@@ -120,7 +122,7 @@ The coach talks only to Ollama on `localhost`. The one other connection is the u
 
 - The coach is a small local model. Its questions and its model recommendation are good defaults, not guarantees; read the result before you send it.
 - The installer and the clipboard code are for Windows.
-- Ollama must be running. If it is not, the app shows a red dot and a notice, and checks again when you press `ctrl+s`.
+- Ollama must be running. If it is not, the app shows a red dot and a notice, and checks again when you press `ctrl+s`. If Ollama is not installed at all, the notice gives the download link.
 - The app warns only about the model it is set to use. If that model is not downloaded, the notice gives the `ollama pull` command and, when another model from `config.json` is installed, points to `f3`.
 - The update check needs internet access. Without it, the app works as before and skips the check.
 

@@ -262,6 +262,9 @@ class ChangelogTests(unittest.TestCase):
         text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn(f"## {version}", text.splitlines(), "add an entry for this version to CHANGELOG.md")
         self.assertTrue(up.changes_between(text, "0", version, limit=1000), "the entry has no bullet lines")
+        headings = [m.group(1) for m in (up.SECTION_RE.match(ln.strip()) for ln in text.splitlines()) if m]
+        self.assertEqual(headings[0], version, "the newest entry and VERSION must name the same version")
+        self.assertEqual(sorted(headings, key=up.parse_version, reverse=True), headings, "newest first")
 
 
 def git(cwd: Path, *args: str) -> str:
