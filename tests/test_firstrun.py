@@ -5,6 +5,7 @@ python -B -m unittest discover -s tests      (needs: pip install textual)
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -29,18 +30,22 @@ class FirstRunTests(unittest.IsolatedAsyncioTestCase):
         self._load_config = core.load_config
         self._state_file = coach_tui.STATE_FILE
         self._models = core.ollama_models
+        self._installed = core.ollama_installed
         self._notes = list(coach_tui.STARTUP_NOTES)
         coach_tui.STARTUP_NOTES.clear()
-        core.load_config = lambda path=None: {
+        self.cfg = {
             **core.DEFAULT_CONFIG,
             "contexts_dir": str(self.tmp / "contexts"),
             "models": ["qwen3.5:9b", "qwen3.5:4b"],
         }
+        core.load_config = lambda path=None: dict(self.cfg)
+        core.ollama_installed = lambda: True  # whatever this computer has, Ollama counts as installed
         coach_tui.STATE_FILE = self.tmp / "state.json"
 
     def tearDown(self):
         core.load_config = self._load_config
         core.ollama_models = self._models
+        core.ollama_installed = self._installed
         coach_tui.STATE_FILE = self._state_file
         coach_tui.STARTUP_NOTES[:] = self._notes
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -117,6 +122,60 @@ class FirstRunTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.ollama_ok, True)
             self.assertEqual(len(notices(app)), count)  # the recheck is silent
 
+    async def wait_for(self, pilot, condition, what, timeout=10.0):
+        """Poll until condition() holds. A fixed pause is a guess, and a slow machine needs longer."""
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail(f"timed out waiting for {what}")
+            await pilot.pause(0.05)
+
+    async def test_ollama_not_installed_points_to_the_download(self):
+        core.ollama_installed = lambda: False
+        self.ollama_down()
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.wait_for(pilot, lambda: app.ollama_ok is not None, "the Ollama check")
+            self.assertIs(app.ollama_ok, False)
+            errors = [m for sev, m in notices(app) if sev == "error"]
+            self.assertEqual(len(errors), 1)
+            self.assertIn("is not installed", errors[0])
+            self.assertIn("https://ollama.com/download", errors[0])
+            self.assertIn("No thanks, I'll use Ollama locally", errors[0])
+            self.assertNotIn("not reachable", errors[0])
+
+    async def test_installed_but_not_running_is_not_called_missing(self):
+        core.ollama_installed = lambda: True
+        self.ollama_down()
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.wait_for(pilot, lambda: app.ollama_ok is not None, "the Ollama check")
+            errors = [m for sev, m in notices(app) if sev == "error"]
+            self.assertEqual(len(errors), 1)
+            self.assertIn("not reachable", errors[0])
+            self.assertNotIn("ollama.com", errors[0])
+            self.assertNotIn("not installed", errors[0])
+
+    async def test_a_remote_ollama_is_never_called_not_installed(self):
+        core.ollama_installed = lambda: False  # true of this computer, and beside the point
+        self.cfg["ollama_url"] = "http://192.168.1.20:11434"
+        self.ollama_down()
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.wait_for(pilot, lambda: app.ollama_ok is not None, "the Ollama check")
+            errors = [m for sev, m in notices(app) if sev == "error"]
+            self.assertEqual(len(errors), 1)
+            self.assertIn("not reachable at http://192.168.1.20:11434", errors[0])
+            self.assertNotIn("not installed", errors[0])
+
+    async def test_an_answering_ollama_is_never_called_not_installed(self):
+        core.ollama_installed = lambda: False  # for example Ollama installed in a folder nobody looks in
+        self.ollama_has("qwen3.5:9b")
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.wait_for(pilot, lambda: app.ollama_ok is not None, "the Ollama check")
+            self.assertIs(app.ollama_ok, True)
+            self.assertEqual(notices(app), [])
 
     async def test_f1_opens_the_key_sheet_while_typing_but_question_mark_is_text(self):
         self.ollama_has("qwen3.5:9b")
@@ -156,6 +215,52 @@ class FirstRunTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ctrl+q", keys, step)
             self.assertNotIn("?", keys, step)
             self.assertLessEqual(len(coach_tui.hint_line(pairs).plain), 80 - 4, step)
+
+
+@unittest.skipIf(coach_tui is None, "textual is not installed")
+class OllamaNoticeTests(unittest.TestCase):
+    """The three things that can be wrong with Ollama, without starting the interface."""
+
+    CFG = {"ollama_url": "http://localhost:11434", "models": ["qwen3.5:9b", "qwen3.5:4b"]}
+
+    def notice(self, names, installed=True, model="qwen3.5:9b", **cfg):
+        return coach_tui.ollama_notice({**self.CFG, **cfg}, model, names, installed)
+
+    def test_everything_in_place_gives_no_notice(self):
+        self.assertIsNone(self.notice(["qwen3.5:9b"]))
+        self.assertIsNone(self.notice(["qwen3.5:9b", "other"], installed=False))
+
+    def test_not_installed(self):
+        text, severity = self.notice(None, installed=False)
+        self.assertEqual(severity, "error")
+        self.assertIn("Ollama is not installed", text)
+        self.assertIn("https://ollama.com/download", text)
+        self.assertIn("No thanks, I'll use Ollama locally", text)
+
+    def test_installed_but_not_running(self):
+        text, severity = self.notice(None, installed=True)
+        self.assertEqual(severity, "error")
+        self.assertIn("not reachable at http://localhost:11434", text)
+        self.assertNotIn("ollama.com", text)
+
+    def test_model_missing(self):
+        text, severity = self.notice(["something-else:1b"])
+        self.assertEqual(severity, "warning")
+        self.assertIn("ollama pull qwen3.5:9b", text)
+        self.assertNotIn("f3", text)
+        text, _ = self.notice(["qwen3.5:4b"])
+        self.assertIn("f3", text)
+        self.assertIn("qwen3.5:4b", text)
+
+    def test_the_three_notices_differ(self):
+        texts = {self.notice(None, installed=False)[0], self.notice(None)[0], self.notice([])[0]}
+        self.assertEqual(len(texts), 3)
+
+    def test_only_a_local_address_can_be_not_installed(self):
+        for url in ("http://localhost:11434", "http://127.0.0.1:11434", "http://[::1]:11434"):
+            self.assertIn("not installed", self.notice(None, installed=False, ollama_url=url)[0], url)
+        for url in ("http://192.168.1.20:11434", "http://ollama.example.com:11434"):
+            self.assertIn("not reachable", self.notice(None, installed=False, ollama_url=url)[0], url)
 
 
 if __name__ == "__main__":

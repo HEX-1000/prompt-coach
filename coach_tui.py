@@ -119,6 +119,30 @@ def hint_line(pairs) -> Text:
     return out
 
 
+def ollama_notice(cfg: dict, model: str, names: list[str] | None, installed: bool = True) -> tuple[str, str] | None:
+    """The notice about Ollama and the selected model as (text, severity), or None when all is well.
+
+    names is the model list Ollama returned, or None when Ollama did not answer. Three cases:
+      not installed   no answer and no ollama program on this computer (only for a local address)
+      not reachable   no answer, but the program is installed: it is not running
+      model missing   Ollama answered, without the selected model
+    """
+    if names is None:
+        if not installed and core.is_local_url(cfg["ollama_url"]):
+            return (f"Ollama is not installed. Get it from {core.OLLAMA_DOWNLOAD_URL} . "
+                    f"When the installer asks you to sign in, choose '{core.OLLAMA_SKIP_SIGN_IN}'. "
+                    "Then press ctrl+s again.", "error")
+        return (f"Ollama is not reachable at {cfg['ollama_url']}. Start Ollama from the Start menu, "
+                "wait for its tray icon, then press ctrl+s again.", "error")
+    if model in names:
+        return None
+    message = f"Model {model} is not downloaded. In PowerShell run: ollama pull {model}"
+    others = [m for m in cfg["models"] if m in names]
+    if others:
+        message += f". Or press f3 to use {others[0]}, which is already installed."
+    return message, "warning"
+
+
 def load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -303,35 +327,28 @@ class CoachApp(App):
 
     def _check_ollama(self, quiet: bool = False) -> None:
         """Ask Ollama which models it has. With quiet=True only the status dot is updated."""
+        installed = True
         try:
             names = core.ollama_models(self.cfg)
         except core.CoachError:
             names = None
-        self.call_from_thread(self._ollama_result, names, quiet)
+            if not quiet:
+                installed = core.ollama_installed()  # looks at the disk, so it stays off the UI thread
+        self.call_from_thread(self._ollama_result, names, quiet, installed)
 
     def _recheck_ollama(self) -> None:
         self.run_worker(lambda: self._check_ollama(quiet=True), thread=True, group="ping")
 
-    def _ollama_result(self, names: list[str] | None, quiet: bool = False) -> None:
+    def _ollama_result(self, names: list[str] | None, quiet: bool = False, installed: bool = True) -> None:
         self.ollama_ok = names is not None
         if not quiet:
-            self._ollama_advice(names)
+            self._ollama_advice(names, installed)
         self.refresh_chrome()
 
-    def _ollama_advice(self, names: list[str] | None) -> None:
-        if names is None:
-            self.notify(
-                f"Ollama is not reachable at {self.cfg['ollama_url']}. Start Ollama from the Start menu, "
-                "wait for its tray icon, then press ctrl+s again.",
-                severity="error", timeout=12)
-            return
-        if self.model in names:
-            return
-        message = f"Model {self.model} is not downloaded. In PowerShell run: ollama pull {self.model}"
-        others = [m for m in self.cfg["models"] if m in names]
-        if others:
-            message += f". Or press f3 to use {others[0]}, which is already installed."
-        self.notify(message, severity="warning", timeout=12)
+    def _ollama_advice(self, names: list[str] | None, installed: bool = True) -> None:
+        notice = ollama_notice(self.cfg, self.model, names, installed)
+        if notice:
+            self.notify(notice[0], severity=notice[1], timeout=12)
 
     def go(self, step: str) -> None:
         self.step = step

@@ -116,7 +116,7 @@ else {
 }
 
 if (-not $OllamaExe) {
-    $Notes.Add("Ollama is not installed. Get it from https://ollama.com/download . When it asks you to sign in, choose 'No thanks, I'll use Ollama locally'.")
+    $Notes.Add("Ollama is not installed. Get it from https://ollama.com/download . When it asks you to sign in, choose 'No thanks, I'll use Ollama locally'. Then run this script again to check the models.")
 } else {
     $wanted = @()
     try { $wanted = @((Get-Content (Join-Path $App "config.json") -Raw | ConvertFrom-Json).models) } catch { }

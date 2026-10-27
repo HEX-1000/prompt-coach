@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import urllib.error
@@ -27,6 +28,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -211,6 +213,24 @@ def _post(cfg: dict, route: str, body: dict | None, timeout: float) -> dict:
 def ollama_models(cfg: dict) -> list[str]:
     data = _post(cfg, "/api/tags", None, timeout=5)
     return [m.get("name", "") for m in data.get("models", [])]
+
+
+# What install.ps1 and the TUI tell a user who has no Ollama yet. Keep the two in step.
+OLLAMA_DOWNLOAD_URL = "https://ollama.com/download"
+OLLAMA_SKIP_SIGN_IN = "No thanks, I'll use Ollama locally"
+
+
+def ollama_installed() -> bool:
+    """True when the ollama program is on this computer: on PATH, or in its usual Windows folder."""
+    if shutil.which("ollama"):
+        return True
+    local = os.environ.get("LOCALAPPDATA")
+    return bool(local) and (Path(local) / "Programs" / "Ollama" / "ollama.exe").exists()
+
+
+def is_local_url(url: str) -> bool:
+    """True for an address on this computer. A remote Ollama is never 'not installed'."""
+    return (urlparse(url).hostname or "") in ("localhost", "127.0.0.1", "::1")
 
 
 @dataclass
