@@ -288,7 +288,7 @@ class CoachApp(App):
         self.set_interval(0.25, self._tick)
         self.run_worker(self._check_ollama, thread=True, group="ping")
         for text, severity in STARTUP_NOTES:
-            self.notify(text, severity=severity, timeout=8)
+            self.notify(text, severity=severity, timeout=20 if "\n" in text else 8)
 
     # ------------------------------------------------------------------ chrome
 
@@ -595,6 +595,21 @@ class CoachApp(App):
             self.notify("Final prompt copied. Edit it here and press y or ctrl+y to copy again.")
 
 
+def update_notice(label: str, app_dir=None) -> str:
+    """The notice after an update: the versions ("1.2.0 to 1.3.0") and what changed, from CHANGELOG.md."""
+    text = f"Prompt Coach updated ({label})."
+    old, _, new = label.partition(" to ")
+    try:
+        import coach_update
+
+        news = coach_update.whats_new(app_dir or core.APP_DIR, old, new) if new else []
+    except Exception:  # the notice is a courtesy; it must never stop the app from starting
+        news = []
+    if news:
+        text += " What's new:\n" + "\n".join(f"- {line}" for line in news)
+    return text
+
+
 def auto_update() -> int | None:
     """Look for a newer version before the UI starts (see coach_update.py).
 
@@ -602,7 +617,7 @@ def auto_update() -> int | None:
     process's place. Returns None to carry on starting this copy. Never raises."""
     done = os.environ.get("PROMPT_COACH_UPDATED")
     if done:  # this is the relaunch after an update
-        STARTUP_NOTES.append((f"Prompt Coach updated ({done}).", "information"))
+        STARTUP_NOTES.append((update_notice(done), "information"))
         return None
     try:
         if not core.load_config().get("auto_update", True):

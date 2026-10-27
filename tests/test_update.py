@@ -13,6 +13,22 @@ import coach_update as up  # noqa: E402
 
 GOOD_PY = "VALUE = 'new'\n"
 
+CHANGELOG_TEXT = """# Changelog
+
+Newest first.
+
+## 1.3.0
+
+- Third thing.
+- Fourth thing.
+
+## 1.2.0
+- Second thing.
+
+## 1.1.0
+- First thing.
+"""
+
 
 def make_zip(path: Path, files: dict[str, str | bytes], top: str = "prompt-coach-main") -> None:
     with zipfile.ZipFile(path, "w") as zf:
@@ -171,8 +187,21 @@ class ZipUpdateTests(unittest.TestCase):
                     "history/x.json", ".venv/Scripts/python.exe", ".git/config", "pkg/__pycache__/a.pyc"):
             self.assertTrue(up.is_protected(rel), rel)
         for rel in ("coach_tui.py", "README.md", "contexts/_template.md", "rules/README.md",
-                    "assets/icon.ico", "requirements.txt", "VERSION"):
+                    "assets/icon.ico", "requirements.txt", "VERSION", "CHANGELOG.md"):
             self.assertFalse(up.is_protected(rel), rel)
+
+    def test_the_changelog_is_shipped_and_whats_new_reads_it(self):
+        remote = self.new_remote(**{"CHANGELOG.md": CHANGELOG_TEXT})
+        res = up.check_and_update(self.app, **remote.urls)
+        self.assertEqual((res.status, res.old, res.new), ("updated", "1.0.0", "1.1.0"), res.message)
+        self.assertEqual((self.app / "CHANGELOG.md").read_text(encoding="utf-8"), CHANGELOG_TEXT)
+        self.assertEqual(up.whats_new(self.app, res.old, res.new), ["First thing."])
+
+    def test_an_update_without_a_changelog_still_works_and_says_nothing_new(self):
+        res = up.check_and_update(self.app, **self.new_remote().urls)
+        self.assertEqual(res.status, "updated", res.message)
+        self.assertFalse((self.app / "CHANGELOG.md").exists())
+        self.assertEqual(up.whats_new(self.app, res.old, res.new), [])
 
     def test_version_parsing(self):
         self.assertEqual(up.parse_version("1.10.0"), (1, 10, 0))
@@ -181,6 +210,58 @@ class ZipUpdateTests(unittest.TestCase):
         self.assertTrue(up.is_newer("1.10.0", "1.9.0"))
         self.assertFalse(up.is_newer("1.0.0", "1.0.0"))
         self.assertTrue(up.is_newer("1.0.1", "0"))
+
+
+class ChangelogTests(unittest.TestCase):
+    def test_changes_between_two_versions(self):
+        self.assertEqual(up.changes_between(CHANGELOG_TEXT, "1.2.0", "1.3.0"), ["Third thing.", "Fourth thing."])
+        self.assertEqual(up.changes_between(CHANGELOG_TEXT, "1.1.0", "1.3.0"),
+                         ["1.3.0: Third thing.", "1.3.0: Fourth thing.", "1.2.0: Second thing."])
+        self.assertEqual(up.changes_between(CHANGELOG_TEXT, "1.3.0", "1.3.0"), [])  # nothing newer than you have
+        self.assertEqual(up.changes_between(CHANGELOG_TEXT, "1.4.0", "1.5.0"), [])
+        self.assertEqual(up.changes_between(CHANGELOG_TEXT, "1.1.0", "1.2.0"), ["Second thing."])  # not past new
+        self.assertEqual(up.changes_between(CHANGELOG_TEXT, "0", "1.1.0"), ["First thing."])
+
+    def test_versions_compare_as_numbers(self):
+        text = "## 1.10.0\n- ten\n\n## 1.9.0\n- nine\n\n## v1.2\n- two\n"
+        self.assertEqual(up.changes_between(text, "1.9.0", "1.10.0"), ["ten"])
+        self.assertEqual(up.changes_between(text, "1.1.0", "1.9.0"), ["1.9.0: nine", "1.2: two"])
+
+    def test_a_long_changelog_is_cut_with_a_pointer_to_the_file(self):
+        text = "## 1.9.0\n" + "".join(f"- line {n}\n" for n in range(8))
+        self.assertEqual(up.changes_between(text, "1.8.0", "1.9.0", limit=3),
+                         ["line 0", "line 1", "line 2", "and 5 more in CHANGELOG.md"])
+        lines = up.changes_between(text, "1.8.0", "1.9.0")  # the default limit is 5
+        self.assertEqual((len(lines), lines[-1]), (6, "and 3 more in CHANGELOG.md"))
+
+    def test_exactly_the_limit_is_not_cut(self):
+        text = "## 1.9.0\n" + "".join(f"- line {n}\n" for n in range(5))
+        self.assertEqual(up.changes_between(text, "1.8.0", "1.9.0"), [f"line {n}" for n in range(5)])
+
+    def test_text_that_is_not_a_changelog_gives_nothing(self):
+        for text in ("", "no headings\n- a bullet\n", "## not a version\n- x\n", "- before any heading\n## 1.1.0\n"):
+            self.assertEqual(up.changes_between(text, "1.0.0", "2.0.0"), [], repr(text))
+
+    def test_whats_new_never_fails(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.assertEqual(up.whats_new(None, "1.0.0", "1.1.0"), [])
+        self.assertEqual(up.whats_new(tmp, "1.0.0", "1.1.0"), [])  # no CHANGELOG.md there
+        (tmp / "CHANGELOG.md").write_bytes(b"\xff\xfe## 1.1.0\n- not utf-8\n")
+        self.assertEqual(up.whats_new(tmp, "1.0.0", "1.1.0"), [])
+        (tmp / "CHANGELOG.md").unlink()
+        (tmp / "CHANGELOG.md").mkdir()  # a folder where the file should be
+        self.assertEqual(up.whats_new(tmp, "1.0.0", "1.1.0"), [])
+        (tmp / "CHANGELOG.md").rmdir()
+        (tmp / "CHANGELOG.md").write_text(CHANGELOG_TEXT, encoding="utf-8")
+        self.assertEqual(up.whats_new(tmp, "1.2.0", "1.3.0"), ["Third thing.", "Fourth thing."])
+
+    def test_the_real_changelog_has_an_entry_for_the_current_version(self):
+        root = Path(__file__).resolve().parent.parent
+        version = (root / "VERSION").read_text(encoding="utf-8").strip()
+        text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## {version}", text.splitlines(), "add an entry for this version to CHANGELOG.md")
+        self.assertTrue(up.changes_between(text, "0", version, limit=1000), "the entry has no bullet lines")
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -211,6 +292,7 @@ class GitUpdateTests(unittest.TestCase):
         git(self.tmp, "clone", "-q", str(self.origin), str(self.app))
         (seed / "VERSION").write_text("1.1.0\n")
         (seed / "coach_core.py").write_text("VALUE = 2\n")
+        (seed / "CHANGELOG.md").write_text(CHANGELOG_TEXT)
         git(seed, "add", "-A")
         git(seed, "commit", "-q", "-m", "two")
         git(seed, "push", "-q", str(self.origin), "main")
@@ -228,6 +310,12 @@ class GitUpdateTests(unittest.TestCase):
         res = up.check_and_update(self.app, **self.kw)
         self.assertEqual((res.status, res.new), ("updated", "1.1.0"), res.message)
         self.assertEqual((self.app / "coach_core.py").read_text(), "VALUE = 2\n")
+
+    def test_the_pull_brings_the_changelog(self):
+        self.assertFalse((self.app / "CHANGELOG.md").exists())
+        res = up.check_and_update(self.app, **self.kw)
+        self.assertEqual(res.status, "updated", res.message)
+        self.assertEqual(up.whats_new(self.app, res.old, res.new), ["First thing."])
 
     def test_config_edit_does_not_block_the_pull(self):
         (self.app / "config.json").write_text('{"models": ["mine"]}')
