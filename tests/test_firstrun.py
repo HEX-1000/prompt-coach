@@ -2,12 +2,14 @@
 
 python -B -m unittest discover -s tests      (needs: pip install textual)
 """
+import os
 import shutil
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -176,6 +178,55 @@ class FirstRunTests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for(pilot, lambda: app.ollama_ok is not None, "the Ollama check")
             self.assertIs(app.ollama_ok, True)
             self.assertEqual(notices(app), [])
+
+    # ------------------------------------------------------------------ after an update
+
+    def app_dir_with_changelog(self, text="## 1.3.0\n- Third.\n\n## 1.2.0\n- Second.\n"):
+        folder = self.tmp / "app"
+        folder.mkdir(exist_ok=True)
+        if text is not None:
+            (folder / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        return folder
+
+    def test_the_update_notice_lists_what_changed(self):
+        folder = self.app_dir_with_changelog()
+        self.assertEqual(coach_tui.update_notice("1.2.0 to 1.3.0", folder),
+                         "Prompt Coach updated (1.2.0 to 1.3.0). What's new:\n- Third.")
+        self.assertEqual(coach_tui.update_notice("1.1.0 to 1.3.0", folder),
+                         "Prompt Coach updated (1.1.0 to 1.3.0). What's new:\n- 1.3.0: Third.\n- 1.2.0: Second.")
+
+    def test_the_update_notice_without_a_changelog_is_the_plain_line(self):
+        folder = self.app_dir_with_changelog(text=None)
+        self.assertEqual(coach_tui.update_notice("1.2.0 to 1.3.0", folder), "Prompt Coach updated (1.2.0 to 1.3.0).")
+        self.assertEqual(coach_tui.update_notice("garbage", folder), "Prompt Coach updated (garbage).")
+
+    def test_the_restarted_app_queues_the_update_notice(self):
+        folder = self.app_dir_with_changelog()
+        with mock.patch.dict(os.environ, {"PROMPT_COACH_UPDATED": "1.2.0 to 1.3.0"}), \
+                mock.patch.object(core, "APP_DIR", folder):
+            self.assertIsNone(coach_tui.auto_update())  # no second update check, no restart
+        self.assertEqual(coach_tui.STARTUP_NOTES,
+                         [("Prompt Coach updated (1.2.0 to 1.3.0). What's new:\n- Third.", "information")])
+
+    async def test_the_update_notice_is_shown_and_stays_long_enough_to_read(self):
+        self.ollama_has("qwen3.5:9b")
+        coach_tui.STARTUP_NOTES.append((coach_tui.update_notice("1.2.0 to 1.3.0", self.app_dir_with_changelog()),
+                                        "information"))
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.wait_for(pilot, lambda: len(app._notifications) > 0, "the update notice")
+            (note,) = app._notifications
+            self.assertEqual(note.severity, "information")
+            self.assertIn("What's new:\n- Third.", note.message)
+            self.assertGreaterEqual(note.timeout, 20)
+
+    async def test_a_one_line_startup_notice_keeps_the_short_timeout(self):
+        self.ollama_has("qwen3.5:9b")
+        coach_tui.STARTUP_NOTES.append(("Update check: offline.", "warning"))
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.wait_for(pilot, lambda: len(app._notifications) > 0, "the startup notice")
+            self.assertEqual([n.timeout for n in app._notifications], [8])
 
     async def test_f1_opens_the_key_sheet_while_typing_but_question_mark_is_text(self):
         self.ollama_has("qwen3.5:9b")

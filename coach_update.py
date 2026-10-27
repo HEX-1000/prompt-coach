@@ -15,6 +15,9 @@ How it updates
   - Any other copy (a downloaded ZIP): the repository ZIP is downloaded, every Python file is
     syntax-checked, and only then are files written.
 
+After an update the app shows the entries of CHANGELOG.md between your old version and the
+new one (whats_new). CHANGELOG.md is shipped like any other file of the repository.
+
 Nothing about you is sent: the requests are plain GETs to raw.githubusercontent.com and
 github.com. Turn it off with "auto_update": false in config.json.
 
@@ -320,10 +323,52 @@ def check_and_update(
     return result
 
 
+# --------------------------------------------------------------------------- what's new
+
+CHANGELOG = "CHANGELOG.md"
+SECTION_RE = re.compile(r"^##\s+v?(\d+(?:\.\d+){0,3})\s*$")
+
+
+def changes_between(text: str, old: str, new: str, limit: int = 5) -> list[str]:
+    """The entries of CHANGELOG.md for versions after old, up to and including new.
+
+    One version gives its lines as they are. Several give each line a "version: " prefix.
+    More than limit lines are cut, with a pointer to the file."""
+    sections: list[tuple[str, list[str]]] = []
+    for line in text.splitlines():
+        heading = SECTION_RE.match(line.strip())
+        if heading:
+            sections.append((heading.group(1), []))
+        elif sections and line.lstrip().startswith("- "):
+            sections[-1][1].append(line.lstrip()[2:].strip())
+    wanted = [(v, items) for v, items in sections if is_newer(v, old) and not is_newer(v, new)]
+    several = len(wanted) > 1
+    lines = [f"{v}: {item}" if several else item for v, items in wanted for item in items]
+    if len(lines) > limit:
+        lines = lines[:limit] + [f"and {len(lines) - limit} more in {CHANGELOG}"]
+    return lines
+
+
+def whats_new(app_dir: Path | None, old: str, new: str) -> list[str]:
+    """What changed between two versions, from CHANGELOG.md in the app folder. Never raises."""
+    if app_dir is None:
+        return []
+    try:
+        return changes_between((Path(app_dir) / CHANGELOG).read_text(encoding="utf-8"), old, new)
+    except (OSError, ValueError):
+        return []
+
+
 def main() -> int:
     app_dir = Path(__file__).resolve().parent
     result = check_and_update(app_dir)
     print(f"{result.status}: local {result.old}, GitHub {result.new or '?'} {result.message}".strip())
+    if result.status == "updated":
+        news = whats_new(app_dir, result.old, result.new)
+        if news:
+            print("What's new:")
+            for line in news:
+                print(f"  - {line}")
     return 0 if result.status in ("current", "updated", "offline") else 1
 
 
