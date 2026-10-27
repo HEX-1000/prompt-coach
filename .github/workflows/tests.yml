@@ -25,11 +25,16 @@ jobs:
       - name: Run the tests
         shell: bash
         run: python -B -m unittest discover -s tests -v 2>&1 | tee unittest.log
-      - name: Show the failures as annotations
-        if: failure()
+      - name: Report the result as an annotation
+        if: always()
         shell: python
+        env:
+          JOB_STATUS: ${{ job.status }}
         run: |
-          import pathlib
-          text = pathlib.Path("unittest.log").read_text(errors="replace")[-3500:]
-          text = text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
-          print("::error title=unittest::" + text)
+          import os, pathlib
+          log = pathlib.Path("unittest.log")
+          text = log.read_text(errors="replace").replace("\r", "") if log.exists() else "no unittest.log"
+          failed = os.environ["JOB_STATUS"] != "success"
+          text = text[-3500:] if failed else "\n".join(text.strip().splitlines()[-4:])
+          text = text.replace("%", "%25").replace("\n", "%0A")
+          print(("::error title=unittest::" if failed else "::notice title=unittest::") + text)
