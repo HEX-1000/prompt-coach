@@ -12,7 +12,8 @@ Context sources:
   - the user's writing rules (rules/communication_rules.md), used only for the
     coach's own behaviour and style, never copied into the final prompt.
 
-Standard library only. Local only: the one network call goes to Ollama.
+Standard library only. The coach itself talks only to Ollama on localhost. The one other network
+use is the launch-time update check in coach_update.py, which can be turned off.
 """
 from __future__ import annotations
 
@@ -43,6 +44,8 @@ DEFAULT_CONFIG = {
     "history_dir": "history",
     "include_max_chars": 12000,
     "max_questions": 5,
+    # Check GitHub for a newer version on launch and update in place. See coach_update.py.
+    "auto_update": True,
 }
 
 OUTPUT_LANGUAGES = ["same", "English", "Turkish"]
