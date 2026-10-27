@@ -11,17 +11,40 @@ $App = $PSScriptRoot
 # Problems that do not stop the install (Ollama, models) are collected and printed at the end.
 $Notes = New-Object System.Collections.Generic.List[string]
 
-# Python 3.14 from the Python install manager; falls back to the py launcher.
+# Python: the newest 3.10 or newer from the Python install manager folder, then the py launcher,
+# then python on PATH. The python.exe in WindowsApps only opens the Microsoft Store, so it is skipped.
 $PyHelp = "Install Python 3.10 or newer from https://www.python.org/downloads/ (tick 'Add python.exe to PATH'), then run this script again."
-$Py = Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.14-64\python.exe"
+$Py = $null
 $PyArgs = @()
-if (-not (Test-Path $Py)) {
+$managed = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Python") -Directory -Filter "pythoncore-3*" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $folderVersion = $null
+        try { $folderVersion = [version]($_.Name -replace '^pythoncore-(\d+\.\d+).*$', '$1') } catch { }
+        if ($folderVersion -and $folderVersion -ge [version]"3.10") {
+            [pscustomobject]@{ Version = $folderVersion; Exe = (Join-Path $_.FullName "python.exe") }
+        }
+    } |
+    Where-Object { Test-Path $_.Exe } |
+    Sort-Object Version -Descending |
+    Select-Object -First 1
+if ($managed) {
+    $Py = $managed.Exe
+} else {
     $launcher = Get-Command py -ErrorAction SilentlyContinue
-    if (-not $launcher) { throw "Python was not found. $PyHelp" }
-    $Py = $launcher.Source
-    $PyArgs = @("-3")
+    if ($launcher) {
+        $Py = $launcher.Source
+        $PyArgs = @("-3")
+    } else {
+        $python = Get-Command python -All -ErrorAction SilentlyContinue |
+            Where-Object { $_.Source -notlike "*\WindowsApps\*" } |
+            Select-Object -First 1
+        if ($python) { $Py = $python.Source }
+    }
 }
-$PyVersion = (& $Py @PyArgs -c "import sys; print('%d.%d' % sys.version_info[:2])").Trim()
+if (-not $Py) { throw "Python was not found. $PyHelp" }
+$PyVersion = & $Py @PyArgs -c "import sys; print('%d.%d' % sys.version_info[:2])"
+if ($LASTEXITCODE -ne 0 -or -not $PyVersion) { throw "Python could not be started ($Py). $PyHelp" }
+$PyVersion = "$PyVersion".Trim()
 $PyParts = $PyVersion.Split(".")
 if ([int]$PyParts[0] -lt 3 -or ([int]$PyParts[0] -eq 3 -and [int]$PyParts[1] -lt 10)) {
     throw "Python $PyVersion is too old. $PyHelp"
