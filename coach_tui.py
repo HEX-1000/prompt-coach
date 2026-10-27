@@ -45,13 +45,25 @@ SHEEN = ["#a99cf0", "#c4b5fd", "#ddb8f2", "#f0b4e4", "#ddb8f2", "#c4b5fd", "#a99
 
 STEPS = [("write", "write"), ("clarify", "clarify"), ("result", "result")]
 
+# Shown in the empty prompt box, so a first-time user sees what to do without reading the README.
+PROMPT_PLACEHOLDER = (
+    "Type or paste your prompt here, then press ctrl+s.\n"
+    "\n"
+    "tab    pick a project (optional)\n"
+    "f2     replace this text with the clipboard\n"
+    "f1     all keys\n"
+    "ctrl+q quit"
+)
+
+# f1 opens the key sheet from anywhere. "?" cannot do that inside a text box, where it is just a
+# character, so the hints name f1. Each line fits an 80-column terminal.
 FOOTER_HINTS = {
-    "write": [("ctrl+s", "send"), ("f2", "paste clipboard"), ("tab", "focus"), ("f3", "model"),
-              ("f4", "language"), ("?", "keys")],
-    "clarify": [("ctrl+s", "send / confirm"), ("ctrl+b", "build now"), ("enter", "next field"),
-                ("esc", "back"), ("?", "keys")],
-    "result": [("y / ctrl+y", "copy"), ("tab", "edit"), ("ctrl+n", "new"), ("esc", "back"),
-               ("?", "keys")],
+    "write": [("ctrl+s", "send"), ("f2", "paste"), ("tab", "focus"), ("f3", "model"),
+              ("f4", "lang"), ("f1", "keys"), ("ctrl+q", "quit")],
+    "clarify": [("ctrl+s", "send"), ("ctrl+b", "build"), ("enter", "next"), ("esc", "back"),
+                ("f1", "keys"), ("ctrl+q", "quit")],
+    "result": [("y", "copy"), ("tab", "edit"), ("ctrl+n", "new"), ("esc", "back"),
+               ("f1", "keys"), ("ctrl+q", "quit")],
 }
 
 HELP_TEXT = """\
@@ -61,7 +73,7 @@ HELP_TEXT = """\
   f3            switch local model
   f4            output language: same, English, Turkish
   tab           move focus (projects, text, fields)
-  ?  / f1       this sheet
+  f1            this sheet ("?" also works when you are not typing in a box)
   ctrl+q        quit
 
 [b]write[/b]
@@ -101,7 +113,7 @@ def hint_line(pairs) -> Text:
     out = Text()
     for i, (key, label) in enumerate(pairs):
         if i:
-            out.append("   ")
+            out.append("  ")
         out.append(key, style=f"bold {VIOLET}")
         out.append(" " + label, style=MUTED)
     return out
@@ -217,7 +229,7 @@ class CoachApp(App):
             with ContentSwitcher(initial="write", id="main"):
                 with Vertical(id="write"):
                     yield Static("your prompt", classes="section")
-                    yield TextArea("", id="prompt", soft_wrap=True)
+                    yield TextArea("", id="prompt", soft_wrap=True, placeholder=PROMPT_PLACEHOLDER)
                 with VerticalScroll(id="clarify"):
                     yield Static("what you mean", classes="section")
                     yield Static("", id="understanding", classes="prose")
@@ -289,22 +301,37 @@ class CoachApp(App):
         if self.busy_since is not None:
             self.refresh_chrome()
 
-    def _check_ollama(self) -> None:
+    def _check_ollama(self, quiet: bool = False) -> None:
+        """Ask Ollama which models it has. With quiet=True only the status dot is updated."""
         try:
             names = core.ollama_models(self.cfg)
-            ok = True
-            missing = [m for m in self.cfg["models"] if m not in names]
         except core.CoachError:
-            ok, missing = False, []
-        self.call_from_thread(self._ollama_result, ok, missing)
+            names = None
+        self.call_from_thread(self._ollama_result, names, quiet)
 
-    def _ollama_result(self, ok: bool, missing: list[str]) -> None:
-        self.ollama_ok = ok
-        if not ok:
-            self.notify("Ollama is not reachable. Start it, then try again.", severity="error")
-        elif missing:
-            self.notify("Not pulled yet: " + ", ".join(missing), severity="warning")
+    def _recheck_ollama(self) -> None:
+        self.run_worker(lambda: self._check_ollama(quiet=True), thread=True, group="ping")
+
+    def _ollama_result(self, names: list[str] | None, quiet: bool = False) -> None:
+        self.ollama_ok = names is not None
+        if not quiet:
+            self._ollama_advice(names)
         self.refresh_chrome()
+
+    def _ollama_advice(self, names: list[str] | None) -> None:
+        if names is None:
+            self.notify(
+                f"Ollama is not reachable at {self.cfg['ollama_url']}. Start Ollama from the Start menu, "
+                "wait for its tray icon, then press ctrl+s again.",
+                severity="error", timeout=12)
+            return
+        if self.model in names:
+            return
+        message = f"Model {self.model} is not downloaded. In PowerShell run: ollama pull {self.model}"
+        others = [m for m in self.cfg["models"] if m in names]
+        if others:
+            message += f". Or press f3 to use {others[0]}, which is already installed."
+        self.notify(message, severity="warning", timeout=12)
 
     def go(self, step: str) -> None:
         self.step = step
@@ -436,6 +463,8 @@ class CoachApp(App):
         if not text.strip():
             self.notify("Write or paste a prompt first.", severity="warning")
             return
+        if self.ollama_ok is not True:
+            self._recheck_ollama()
         self.session = core.CoachSession(self.cfg, text, self.context, self.model, self.out_lang)
         for w in self.session.warnings:
             self.notify(w, severity="warning")
@@ -489,6 +518,7 @@ class CoachApp(App):
     def _failed(self, message: str) -> None:
         self._done()
         self.notify(message, severity="error", timeout=10)
+        self._recheck_ollama()
 
     async def _show_round(self, rnd: core.Round) -> None:
         self.query_one("#understanding", Static).update(Text(rnd.understanding or "(empty)"))

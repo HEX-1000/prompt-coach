@@ -19,7 +19,7 @@ How much a request costs depends mostly on two things: how many rounds it takes 
 
 ## How it works
 
-1. **Write.** The app opens in **General Context**, ready to type. To use a project's glossary, press `tab` and pick the project from the **PROJECTS** list. Then type or paste your prompt and press `ctrl+s`.
+1. **Write.** The app opens in **General Context**, ready to type. The empty prompt box lists the first keys to know. To use a project's glossary, press `tab` and pick the project from the **PROJECTS** list. Then type or paste your prompt and press `ctrl+s`.
 2. **Clarify.** The coach restates what you mean, shows the repaired text and asks what it needs to know. Codes such as `D5` or `A02` that are not in the project context are always asked about, never guessed ("term check"). Answer, leave a field empty to skip, or type a correction. `ctrl+s` sends the answers. When the understanding is right and nothing is open, `ctrl+s` builds the prompt.
 3. **Result.** You get the final prompt, the recommended Claude model and effort, and anything still missing. The prompt is already on the clipboard; edit it in place and copy again with `y` or `ctrl+y`.
 
@@ -62,6 +62,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 It creates a Python environment in `.venv` with [Textual](https://textual.textualize.io/), a Windows Terminal profile called **Prompt Coach** with its own color scheme and icon, and a desktop shortcut. Run it again if you move the folder.
 
+At the end it checks that Ollama is installed and running and that one of the models in `config.json` is downloaded. Anything missing is listed under **Before you start**, with the command to fix it. These checks only warn; the app is installed either way. Python older than 3.10 or no Python at all stops the installer, with a link to the download.
+
 **5. Add a project context (optional).** Copy `contexts\_template.md` to a new file, for example `contexts\my-project.md`, and fill in the project name, a one-line description and a glossary of your own terms. The `name:` line is what the PROJECTS list shows. The coach reads the context before every run, so it knows what your abbreviations mean. Optional `include:` paths, such as a project's `CLAUDE.md`, are read fresh each time. Without any context file, General Context is all you see, and every project term gets asked about.
 
 **6. Start it** from the desktop shortcut, or open Windows Terminal and choose **Prompt Coach**.
@@ -78,7 +80,7 @@ It creates a Python environment in `.venv` with [Textual](https://textual.textua
 | `f4` | output language: same, English, Turkish |
 | `y` or `ctrl+y` | copy the result |
 | `esc` | back |
-| `?` or `f1` | all keys |
+| `f1` | all keys (`?` also works when the cursor is not in a text box) |
 | `ctrl+q` | quit |
 
 ## Files
@@ -118,7 +120,8 @@ The coach talks only to Ollama on `localhost`. The one other connection is the u
 
 - The coach is a small local model. Its questions and its model recommendation are good defaults, not guarantees; read the result before you send it.
 - The installer and the clipboard code are for Windows.
-- Ollama must be running.
+- Ollama must be running. If it is not, the app shows a red dot and a notice, and checks again when you press `ctrl+s`.
+- The app warns only about the model it is set to use. If that model is not downloaded, the notice gives the `ollama pull` command and, when another model from `config.json` is installed, points to `f3`.
 - The update check needs internet access. Without it, the app works as before and skips the check.
 
 ## Related
