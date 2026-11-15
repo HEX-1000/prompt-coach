@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/HEX-1000/prompt-coach/discussions/categories/q-a
+    about: Ask about installing and using Prompt Coach, or suggest a change, in Discussions.

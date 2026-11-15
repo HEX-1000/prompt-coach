@@ -138,6 +138,10 @@ The coach talks only to Ollama on `localhost`. The one other connection is the u
 - The app warns only about the model it is set to use. If that model is not downloaded, the notice gives the `ollama pull` command and, when another model from `config.json` is installed, points to `f3`.
 - The update check needs internet access. Without it, the app works as before and skips the check.
 
+## Questions and problems
+
+Questions and ideas go to [Discussions](https://github.com/HEX-1000/prompt-coach/discussions). If something is broken, open an [issue](https://github.com/HEX-1000/prompt-coach/issues) and say what you did and what the app showed. Both pages are public: remove your own prompt text, context files, history records and the Windows user name in file paths before you post, or replace them with a made-up example that shows the same problem.
+
 ## Related
 
 [Token Optimization System](https://github.com/HEX-1000/token-optimization-system): a local MCP server that gives Claude a few relevant sections of your files instead of whole documents.
