@@ -130,6 +130,10 @@ The coach talks only to Ollama on `localhost`. The one other connection is the u
 
 [Token Optimization System](https://github.com/HEX-1000/token-optimization-system): a local MCP server that gives Claude a few relevant sections of your files instead of whole documents.
 
+## Support
+
+Prompt Coach is free and has no paid features. If it is useful to you and you want to support the work, you can do it through [Buy Me a Coffee](https://buymeacoffee.com/hex.1000). The Sponsor button at the top of the repository page opens the same link.
+
 ## License
 
 [MIT](LICENSE). Made by [HEX-1000](https://github.com/HEX-1000).
