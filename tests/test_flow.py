@@ -26,6 +26,10 @@ TEXT = "Summarise the weekly report for E7 in five lines."
 REPLY = {"understanding": "You want a five line summary of the weekly report.",
          "questions": [], "depth": "standard"}
 CONTEXT = "---\nname: Demo\n---\n# Demo\n\n## Glossary\n- E1: first export\n"
+BRIEF = "Demo exports weekly reports."
+BRIEF_CONTEXT = f"---\nname: Demo\n---\n# Demo\n\n{BRIEF}\n\n## Glossary\n- E1: first export\n"
+BLOCK = f"\n\nProject context (Demo):\n{BRIEF}"
+TR_BLOCK = f"\n\nProje bağlamı (Demo):\n{BRIEF}"
 
 
 @unittest.skipIf(coach_tui is None, "textual is not installed")
@@ -171,8 +175,10 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
     TR_TEXT = "Bu raporu kısalt, lütfen çok kısa olsun."
     TRANSLATED = "Shorten this report, please keep it very short."
 
-    def fake_chat(self, gate=None, fail_first=False):
-        """Stage 1 gets REPLY. A translation call waits for gate, and the first one can fail."""
+    def fake_chat(self, gate=None, fail_first=False, calls=None):
+        """Stage 1 gets REPLY. A translation call waits for gate, and the first one can fail.
+
+        calls, when given, collects the parts of every translation call."""
         state = {"failed": False}
 
         def chat(cfg, model, messages, schema, temperature):
@@ -184,6 +190,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 state["failed"] = True
                 raise core.CoachError("Ollama is not reachable")
             parts = json.loads(messages[1]["content"])
+            if calls is not None:
+                calls.append(parts)
             return {k: self.TRANSLATED for k in parts}, STATS
 
         return mock.patch.object(core, "chat_json", chat)
@@ -292,6 +300,145 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(app.session.translation)
                 self.assertIsNone(self.records()[0]["translation"])
 
+    async def test_a_new_build_takes_the_translation_from_the_cache_and_t_asks_the_model_again(self):
+        calls = []
+        with self.fake_chat(calls=calls):
+            app = coach_tui.CoachApp()
+            async with app.run_test(size=(120, 36)) as pilot:
+                await self.to_translating(app, pilot)
+                await self.settle(app, pilot, "result")
+                self.assertEqual(len(calls), 1)
+                await pilot.press("escape")
+                await pilot.press("ctrl+s")
+                await self.settle(app, pilot, "result")
+                self.assertEqual(app.query_one("#final").text, self.TRANSLATED)
+                self.assertEqual(len(calls), 1)          # the same parts: no model call
+                await pilot.press("t")
+                await self.settle(app, pilot, "result")
+                self.assertEqual(len(calls), 2)          # t sends every part again
+                self.assertEqual(app.query_one("#final").text, self.TRANSLATED)
+
+    # ---- project context block
+
+    def meta(self, app):
+        return str(app.query_one("#result-meta").render())
+
+    def state(self):
+        return json.loads((self.tmp / "state.json").read_text(encoding="utf-8"))
+
+    async def test_the_brief_is_attached_and_b_removes_and_adds_it(self):
+        self.project.write_text(BRIEF_CONTEXT, encoding="utf-8")
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.to_clarify(app, pilot)
+            await pilot.press("ctrl+s")
+            final = app.query_one("#final")
+            self.assertEqual(final.text, TEXT + BLOCK)
+            self.assertRegex(self.meta(app), r"project context: attached, demo\.md of \d{4}-\d\d-\d\d, "
+                                             rf"{len(BRIEF)} characters \(b removes it\)")
+            await pilot.press("b")
+            self.assertEqual(final.text, TEXT)
+            self.assertIn("project context: not attached (b adds it)", self.meta(app))
+            self.assertEqual(self.copied, [TEXT + BLOCK, TEXT])     # b copies what it shows
+            self.assertEqual(self.state()["brief_off"], ["demo"])
+            (record,) = self.records()
+            self.assertEqual((record["result"]["brief_chars"], record["result"]["brief_source"]), (0, ""))
+            self.assertEqual(record["copied"]["text"], TEXT)
+            await pilot.press("b")
+            self.assertEqual(final.text, TEXT + BLOCK)
+            self.assertIn("(b removes it)", self.meta(app))
+            self.assertEqual(self.state()["brief_off"], [])
+            (record,) = self.records()                              # still one file
+            self.assertEqual((record["result"]["brief_chars"], record["result"]["brief_source"]),
+                             (len(BRIEF), "demo.md"))
+
+    async def test_a_new_session_starts_from_the_stored_choice(self):
+        self.project.write_text(BRIEF_CONTEXT, encoding="utf-8")
+        (self.tmp / "state.json").write_text('{"brief_off": ["other", "demo"]}', encoding="utf-8")
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.to_clarify(app, pilot)
+            await pilot.press("ctrl+s")
+            self.assertFalse(app.session.attach_brief)
+            self.assertEqual(app.query_one("#final").text, TEXT)
+            self.assertIn("project context: not attached (b adds it)", self.meta(app))
+            await pilot.press("b")
+            self.assertEqual(app.query_one("#final").text, TEXT + BLOCK)
+            self.assertEqual(self.state()["brief_off"], ["other"])  # other projects keep their choice
+
+    async def test_without_brief_text_there_is_no_line_and_b_does_nothing(self):
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.to_clarify(app, pilot)            # the context holds a title and a glossary only
+            await pilot.press("ctrl+s")
+            self.assertNotIn("project context", self.meta(app))
+            await pilot.press("b")
+            self.assertEqual(app.query_one("#final").text, TEXT)
+            self.assertEqual(self.copied, [TEXT])
+            self.assertFalse((self.tmp / "state.json").exists())
+
+    async def test_b_says_when_it_replaces_edits(self):
+        self.project.write_text(BRIEF_CONTEXT, encoding="utf-8")
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await self.to_clarify(app, pilot)
+            await pilot.press("ctrl+s")
+            await pilot.press("b")
+            notes = [n.message for n in app._notifications]
+            self.assertEqual(notes[-1], "Project context removed. Prompt copied.")
+            app.query_one("#final").load_text("my edit")
+            await pilot.press("b")
+            notes = [n.message for n in app._notifications]
+            self.assertIn("Project context attached. Prompt copied.", notes[-1])
+            self.assertIn("your edits in the box are gone", notes[-1])
+            self.assertEqual(app.query_one("#final").text, TEXT + BLOCK)
+
+    async def test_b_with_a_translation_makes_no_model_call_and_keeps_the_view(self):
+        self.project.write_text(BRIEF_CONTEXT, encoding="utf-8")
+        calls = []
+        with self.fake_chat(calls=calls):
+            app = coach_tui.CoachApp()
+            async with app.run_test(size=(120, 36)) as pilot:
+                await self.to_translating(app, pilot)
+                await self.settle(app, pilot, "result")
+                final = app.query_one("#final")
+                self.assertEqual(final.text, self.TRANSLATED + BLOCK)   # English label, brief as written
+                self.assertEqual(calls, [{"1": self.TR_TEXT}])          # the brief is never sent
+                await pilot.press("b")
+                self.assertEqual((final.text, app.result_view), (self.TRANSLATED, "translation"))
+                self.assertEqual(self.copied[-1], self.TRANSLATED)
+                await pilot.press("o")
+                self.assertEqual(final.text, self.TR_TEXT)
+                await pilot.press("b")                                  # on the original view
+                self.assertEqual((final.text, app.result_view), (self.TR_TEXT + TR_BLOCK, "original"))
+                self.assertEqual(self.copied[-1], self.TR_TEXT + TR_BLOCK)
+                await pilot.press("o")
+                self.assertEqual(final.text, self.TRANSLATED + BLOCK)
+                self.assertEqual(len(calls), 1)
+                self.assertFalse(final.read_only)
+                rec = self.records()[0]
+                self.assertEqual(rec["translation"]["text"], self.TRANSLATED + BLOCK)
+                self.assertEqual(len(rec["translation"]["stats"]), 1)   # the one call is still on record
+
+    async def test_b_after_a_language_change_shows_the_original_and_leaves_the_call_to_t(self):
+        self.project.write_text(BRIEF_CONTEXT, encoding="utf-8")
+        calls = []
+        text = "Kurzer Bericht bitte, danke sehr."   # the language guess says neither Turkish nor English
+        with self.fake_chat(calls=calls):
+            app = coach_tui.CoachApp()
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.out_lang = "English"
+                await self.to_clarify(app, pilot, text=text)
+                await pilot.press("ctrl+s")
+                await self.settle(app, pilot, "result")
+                self.assertEqual(app.query_one("#final").text, self.TRANSLATED + BLOCK)
+                app.out_lang = app.session.out_lang = "Turkish"      # f4, without t
+                await pilot.press("b")
+                self.assertEqual(app.query_one("#final").text, text)
+                self.assertEqual((app.result_view, len(calls)), ("original", 1))
+                self.assertNotIn("translation", app.texts)
+                self.assertIn("Press t to translate to Turkish.", [n.message for n in app._notifications][-1])
+
 
 @unittest.skipIf(coach_tui is None, "textual is not installed")
 class FooterTests(unittest.TestCase):
@@ -299,6 +446,10 @@ class FooterTests(unittest.TestCase):
         keys = [k for k, _ in coach_tui.FOOTER_HINTS["clarify"]]
         self.assertEqual(keys, ["ctrl+s", "ctrl+l", "esc", "f1", "ctrl+q"])
         self.assertNotIn("ctrl+b", coach_tui.HELP_TEXT)
+
+    def test_the_help_sheet_lists_the_b_key(self):
+        self.assertRegex(coach_tui.HELP_TEXT, r"(?m)^  b +remove or add the project context block")
+        self.assertIn(("b", "toggle_brief"), [(b.key, b.action) for b in coach_tui.CoachApp.BINDINGS])
 
     def test_footers_fit_80_columns(self):
         for step, pairs in coach_tui.FOOTER_HINTS.items():

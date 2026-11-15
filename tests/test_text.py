@@ -277,12 +277,108 @@ class AssembleTests(unittest.TestCase):
         self.assertTrue(out.endswith("Project terms:\n- prompter text: the script\n- F9: the ninth"), out)
 
     def test_segments_have_the_same_layout_in_every_language(self):
-        en = ct.assemble(DOC_TEXT, doc_questions(), "note", DOC_ENTRIES, "en")
-        tr = ct.assemble(DOC_TEXT, doc_questions(), "note", DOC_ENTRIES, "tr")
+        en = ct.assemble(DOC_TEXT, doc_questions(), "note", DOC_ENTRIES, "en", brief="A brief.", project="Demo")
+        tr = ct.assemble(DOC_TEXT, doc_questions(), "note", DOC_ENTRIES, "tr", brief="A brief.", project="Demo")
         self.assertEqual([k for k, _ in en], [k for k, _ in tr])
         self.assertEqual([t for k, t in en if k == "user"], [t for k, t in tr if k == "user"])
         self.assertIn("user", {k for k, _ in en})
         self.assertIn("fixed", {k for k, _ in en})
+
+    # ---- project context block
+
+    BRIEF = "State on 2026-11-15.\n\nGoal: every install saves tokens."
+
+    def test_the_project_context_sits_between_the_left_block_and_the_terms(self):
+        out = ct.render(ct.assemble(DOC_TEXT, doc_questions(), "The repo is already public.", DOC_ENTRIES, "en",
+                                    brief=self.BRIEF, project="Demo"))
+        block = "\n\nProject context (Demo):\n" + self.BRIEF
+        self.assertEqual(out, DOC_EXAMPLE.replace("\n\nProject terms:", block + "\n\nProject terms:"))
+
+    def test_the_project_context_is_the_last_block_without_terms(self):
+        out = ct.render(ct.assemble("Hello", [Q("Why?", "because")], "a note", [], "en",
+                                    brief=self.BRIEF, project="Demo"))
+        self.assertTrue(out.startswith("Hello\n\nNote: a note\n\nQuestions I was asked"))
+        self.assertTrue(out.endswith("  A: because\n\nProject context (Demo):\n" + self.BRIEF))
+
+    def test_the_project_context_label_in_turkish(self):
+        out = ct.render(ct.assemble("Merhaba", [], "", [], "tr", brief="Kısa özet.", project="Demo"))
+        self.assertEqual(out, "Merhaba\n\nProje bağlamı (Demo):\nKısa özet.")
+
+    def test_no_project_context_block_without_a_brief(self):
+        for brief in ("", "  \n "):
+            self.assertEqual(ct.render(ct.assemble("Hello", [], "", [], "en", brief=brief, project="Demo")), "Hello")
+        self.assertEqual(ct.assemble("Hello", [], "", [], "en"), [("user", "Hello")])
+
+    def test_the_brief_is_one_fixed_segment_so_it_is_never_translated(self):
+        segs = ct.assemble("Hello", [], "", [], "en", brief="  A brief.\n", project="Demo")
+        self.assertEqual(segs, [("user", "Hello"), ("fixed", "\n\nProject context (Demo):\nA brief.")])
+
+    def test_a_brief_without_a_project_name(self):
+        out = ct.render(ct.assemble("Hello", [], "", [], "en", brief="A brief."))
+        self.assertEqual(out, "Hello\n\nProject context:\nA brief.")
+
+    def test_terms_that_only_the_brief_names_are_not_attached(self):
+        entries = ct.parse_glossary("## Glossary\n- F9: the ninth\n")
+        out = ct.render(ct.assemble("Hello", [], "", entries, "en", brief="F9 runs daily.", project="Demo"))
+        self.assertNotIn("Project terms:", out)
+
+
+class BriefTests(unittest.TestCase):
+    def test_title_comments_and_a_glossary_at_the_end_are_removed(self):
+        body = ("# Project\n\n<!-- Brief written 2026-11-15.\n     Keep it short. -->\nState on 2026-11-15.\n\n"
+                "Goal: save tokens.\n\n## Glossary\n- E7: the seventh run\n\n<!-- Add terms here. -->\n")
+        self.assertEqual(ct.brief_from_body(body), "State on 2026-11-15.\n\nGoal: save tokens.")
+
+    def test_a_glossary_in_the_middle(self):
+        body = "# P\n\nIntro text.\n\n## Glossary\n- E7: x\n\n### Sub\n- A1: y\n\n## Stage\n\nStep two.\n"
+        self.assertEqual(ct.brief_from_body(body), "Intro text.\n\n## Stage\n\nStep two.")
+
+    def test_only_a_level_1_heading_on_the_first_line_with_text_is_removed(self):
+        self.assertEqual(ct.brief_from_body("\n\n# Title\nText.\n"), "Text.")
+        self.assertEqual(ct.brief_from_body("<!-- note -->\n# Title\n\nText.\n"), "Text.")
+        self.assertEqual(ct.brief_from_body("## Stage\nText.\n"), "## Stage\nText.")
+        self.assertEqual(ct.brief_from_body("Text.\n# Later\nMore.\n"), "Text.\n# Later\nMore.")
+
+    def test_a_comment_leaves_no_gap(self):
+        self.assertEqual(ct.brief_from_body("One.\n\n<!-- c -->\n\nTwo.\n"), "One.\n\nTwo.")
+        self.assertEqual(ct.brief_from_body("One.\n<!-- c\n   d -->\nTwo.\n"), "One.\nTwo.")
+        self.assertEqual(ct.brief_from_body("Keep <!-- c -->this.\n"), "Keep this.")
+
+    def test_a_comment_followed_by_text_does_not_take_the_text(self):
+        self.assertEqual(ct.brief_from_body("<!-- a --> Text.\n<!-- b -->\nMore.\n"), "Text.\nMore.")
+
+    def test_a_heading_inside_a_comment_is_not_the_glossary(self):
+        body = "Text.\n<!--\n## Glossary\n-->\nMore.\n\n## Glossary\n- E1: x\n"
+        self.assertEqual(ct.brief_from_body(body), "Text.\nMore.")
+
+    def test_empty(self):
+        for body in ("", "  \n\n", "# Title\n", "## Glossary\n- E1: x\n", "<!-- only a comment -->",
+                     "# Title\n\n<!-- c -->\n\n## Sözlük\n- E1: x\n"):
+            self.assertEqual(ct.brief_from_body(body), "", body)
+
+    def test_crlf_becomes_lf(self):
+        self.assertEqual(ct.brief_from_body("# T\r\n\r\nOne.\r\n\r\nTwo.\r\n"), "One.\n\nTwo.")
+
+    def test_clean_brief_keeps_the_title_and_the_glossary(self):
+        text = "<!-- kept current by the project -->\r\n# Brief\r\n\r\n\r\n\r\nNow at stage two.\r\n\r\n## Glossary\r\n- E1: x\r\n"
+        self.assertEqual(ct.clean_brief(text), "# Brief\n\nNow at stage two.\n\n## Glossary\n- E1: x")
+
+    TEXT = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph."
+
+    def test_a_brief_within_the_limit_is_not_cut(self):
+        self.assertEqual(ct.cut_brief(self.TEXT, len(self.TEXT)), (self.TEXT, False))
+        self.assertEqual(ct.cut_brief("", 10), ("", False))
+
+    def test_a_long_brief_is_cut_at_the_last_empty_line_before_the_limit(self):
+        self.assertEqual(ct.cut_brief(self.TEXT, 40), ("First paragraph.\n\nSecond paragraph.", True))
+        self.assertEqual(ct.cut_brief(self.TEXT, 34), ("First paragraph.", True))
+
+    def test_an_empty_line_that_starts_at_the_limit_counts(self):
+        self.assertEqual(ct.cut_brief(self.TEXT, 35), ("First paragraph.\n\nSecond paragraph.", True))
+
+    def test_without_an_empty_line_the_cut_is_at_the_limit(self):
+        self.assertEqual(ct.cut_brief(self.TEXT, 10), ("First para", True))
+        self.assertEqual(ct.cut_brief("x" * 50, 20), ("x" * 20, True))
 
 
 class SplitPartsTests(unittest.TestCase):

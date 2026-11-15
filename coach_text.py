@@ -1,6 +1,6 @@
 """Pure text functions for Prompt Coach. Standard library only, no file or network access.
 
-Language guess, codes, glossary, prompt assembly, part splitting and translation checks.
+Language guess, codes, glossary, project brief, prompt assembly, part splitting and translation checks.
 """
 from __future__ import annotations
 
@@ -231,6 +231,54 @@ def add_glossary_line(file_text: str, term: str, definition: str) -> str:
     return "".join(lines[:at]) + new + nl + "".join(lines[at:])
 
 
+# --------------------------------------------------------------------------- project brief
+
+# A comment that fills its line or lines; the lines go with it. The body cannot run past "-->".
+_COMMENT_LINES_RE = re.compile(r"^[ \t]*<!--(?:(?!-->).)*-->[ \t]*(?:\n|\Z)", re.DOTALL | re.MULTILINE)
+_BLANK_RUN_RE = re.compile(r"\n(?:[ \t]*\n){2,}")
+_EMPTY_LINE_RE = re.compile(r"\n[ \t]*\n")
+
+
+def _without_comments(text: str) -> str:
+    """text without HTML comments. Unlike _strip_comments, the lines a comment filled are removed."""
+    return _COMMENT_RE.sub("", _COMMENT_LINES_RE.sub("", text.replace("\r\n", "\n")))
+
+
+def clean_brief(text: str) -> str:
+    """A brief as it goes into the prompt: no HTML comments, one empty line at most in a row, stripped."""
+    return _BLANK_RUN_RE.sub("\n\n", _without_comments(text)).strip()
+
+
+def brief_from_body(body: str) -> str:
+    """The brief held in the body of a context file.
+
+    The body without HTML comments, without the glossary section (its heading to its end) and
+    without a level-1 heading on the first line that is not empty."""
+    lines = _without_comments(body).splitlines()
+    span = _section_lines(lines)
+    if span:
+        del lines[span[0]:span[1]]
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None:
+        h = _heading(lines[first])
+        if h and h[0] == 1:
+            del lines[first]
+    return clean_brief("\n".join(lines))
+
+
+def cut_brief(text: str, max_chars: int) -> tuple[str, bool]:
+    """(text, was_cut). A text longer than max_chars is cut at the last empty line that starts at
+    or before the limit, and at the limit when there is none."""
+    if len(text) <= max_chars:
+        return text, False
+    at = max_chars
+    for m in _EMPTY_LINE_RE.finditer(text):
+        if m.start() > max_chars:
+            break
+        at = m.start()
+    return text[:at].rstrip(), True
+
+
 # --------------------------------------------------------------------------- final prompt
 
 _LABELS = {
@@ -239,6 +287,7 @@ _LABELS = {
         "answers": "Questions I was asked about this request, and my answers:",
         "q": "Q:", "a": "A:",
         "left": "Questions I was asked and leave to you (say what you chose):",
+        "context": "Project context",
         "terms": "Project terms:",
     },
     "tr": {
@@ -246,9 +295,12 @@ _LABELS = {
         "answers": "Bu istekle ilgili bana sorulan sorular ve cevaplarım:",
         "q": "S:", "a": "C:",
         "left": "Bana sorulan ve kararını sana bıraktığım sorular (neyi seçtiğini söyle):",
+        "context": "Proje bağlamı",
         "terms": "Proje terimleri:",
     },
 }
+# How the label of the project context block starts in each language (tools/replay.py takes the block out).
+CONTEXT_LABELS = tuple(lab["context"] for lab in _LABELS.values())
 
 
 def _state(q) -> str:
@@ -265,14 +317,18 @@ def attached_terms(text: str, note: str, questions, entries: list[GlossaryEntry]
     return terms_in(searched, entries)
 
 
-def assemble(text: str, questions, note: str, entries: list[GlossaryEntry], lang: str) -> list[tuple[str, str]]:
+def assemble(text: str, questions, note: str, entries: list[GlossaryEntry], lang: str,
+             brief: str = "", project: str = "") -> list[tuple[str, str]]:
     """Segments (kind, text), kind 'user' or 'fixed'. The segment layout does not depend on lang.
 
-    questions: objects with .question, .answer, .source and .term (see section 5).
+    questions: objects with .question, .answer, .source and .term.
+    brief: the project brief, attached as it stands under a label that names the project.
+    Order: text, note, answers, questions left to the assistant, project context, project terms.
     """
     lab = _LABELS.get(lang, _LABELS["en"])
     text = text.strip()
     note = one_line(note or "")
+    brief = brief.strip()
     segs: list[tuple[str, str]] = [("user", text)]
 
     if note:
@@ -292,6 +348,11 @@ def assemble(text: str, questions, note: str, entries: list[GlossaryEntry], lang
         segs.append(("fixed", f"\n\n{lab['left']}"))
         for q in left:
             segs += [("fixed", "\n- "), ("user", one_line(q.question))]
+
+    if brief:
+        name = one_line(project)
+        label = f"{lab['context']} ({name}):" if name else f"{lab['context']}:"
+        segs.append(("fixed", f"\n\n{label}\n{brief}"))
 
     found = attached_terms(text, note, questions, entries)
     if checks or found:

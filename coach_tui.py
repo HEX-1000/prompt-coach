@@ -94,6 +94,7 @@ HELP_TEXT = """\
   y / ctrl+y    copy the text on screen (your edits included)
   o             switch between the original and the translation
   t             translate again (after an error, or after f4 changed the language)
+  b             remove or add the project context block, and copy
   g             save the new terms to the glossary of the project
   tab           edit the final prompt; ctrl+y copies while editing
   esc           back to clarify
@@ -225,6 +226,7 @@ class CoachApp(App):
         Binding("g", "save_terms", "save terms"),
         Binding("o", "toggle_original", "original"),
         Binding("t", "retranslate", "translate"),
+        Binding("b", "toggle_brief", "project context"),
         Binding("escape", "back", "back", priority=True),
         Binding("ctrl+q", "quit", "quit", priority=True),
     ]
@@ -502,7 +504,52 @@ class CoachApp(App):
             self.notify("Nothing to translate for this output language.")
             return
         self._remember_view()
-        self._start_translation()
+        self._start_translation(fresh=True)
+
+    def _brief_off(self) -> list:
+        """Keys of the projects whose brief the user switched off (kept in .state.json)."""
+        off = self.state.get("brief_off")
+        return off if isinstance(off, list) else []
+
+    def action_toggle_brief(self) -> None:
+        """Remove or add the project context block. Builds again; no model call."""
+        sess = self.session
+        if self.step != "result" or not sess or self.busy_since is not None or not sess.brief_text:
+            return
+        self._remember_view()
+        edited = self.texts.get("original") != sess.result.final_prompt or (
+            sess.translation is not None and self.texts.get("translation") != sess.translation.text)
+        had_translation = "translation" in self.texts
+
+        sess.attach_brief = not sess.attach_brief
+        off = [k for k in self._brief_off() if k != sess.context.key]
+        self.state["brief_off"] = off if sess.attach_brief else off + [sess.context.key]
+        save_state(self.state)
+
+        res = sess.build()
+        self.texts = {"original": res.final_prompt}
+        # The parts of the user's text did not change, so the translation comes from the cache.
+        # When it cannot (f4 changed the language since), the original is shown and t translates.
+        if had_translation and sess.needs_translation() and sess.translation_cached():
+            self.texts["translation"] = sess.translate().text
+        if self.result_view not in self.texts:
+            self.result_view = "original"
+        text = self.texts[self.result_view]
+        self.query_one("#final", TextArea).load_text(text)
+        self._show_result_meta()
+
+        message = "Project context " + ("attached." if sess.attach_brief else "removed.")
+        if core.copy_to_clipboard(text):
+            sess.mark_copied(text)
+            message += " Prompt copied."
+        else:
+            message += " Press y to copy."
+        if edited:
+            message += " The prompt was built again, so your edits in the box are gone."
+        if had_translation and "translation" not in self.texts and sess.needs_translation():
+            message += f" Press t to translate to {sess.out_lang}."
+        self.notify(message)
+        sess.save()
 
     def action_save_terms(self) -> None:
         if self.step != "result" or not self.session or not self.context:
@@ -554,7 +601,9 @@ class CoachApp(App):
             return
         if self.ollama_ok is not True:
             self._recheck_ollama()
-        self.session = core.CoachSession(self.cfg, text, self.context, self.model, self.out_lang)
+        attach = not (self.context and self.context.key in self._brief_off())
+        self.session = core.CoachSession(self.cfg, text, self.context, self.model, self.out_lang,
+                                         attach_brief=attach)
         for w in self.session.warnings:
             self.notify(w, severity="warning")
         self._run("understanding", self._understand_job)
@@ -644,6 +693,12 @@ class CoachApp(App):
         if res.effort:
             meta.append("   effort ", style=MUTED)
             meta.append(res.effort, style=f"bold {VIOLET}")
+        if sess.brief_text and res.brief_chars:
+            when = f" of {sess.brief_date}" if sess.brief_date else ""
+            meta.append(f"\nproject context: attached, {res.brief_source}{when}, "
+                        f"{res.brief_chars:,} characters (b removes it)", style=TEXT)
+        elif sess.brief_text:
+            meta.append("\nproject context: not attached (b adds it)", style=MUTED)
         if res.terms:
             meta.append(f"\n{len(res.terms)} project terms attached: {', '.join(res.terms)}", style=TEXT)
         new = sess.new_terms()
@@ -702,22 +757,25 @@ class CoachApp(App):
 
     # ------------------------------------------------------------------ translation
 
-    def _start_translation(self) -> None:
-        """Translate in a worker. The original stays visible and read-only until it ends."""
+    def _start_translation(self, fresh: bool = False) -> None:
+        """Translate in a worker. The original stays visible and read-only until it ends.
+
+        Parts this session has translated before come from its cache; fresh=True (the t key)
+        sends every part again."""
         self.translate_error = ""
         self.busy_since = time.monotonic()
         self.busy_label = "translating"
         self.query_one("#final", TextArea).read_only = True
         self.refresh_chrome()
         self._show_result_meta()
-        self.run_worker(self._translate_job, thread=True, exclusive=True, group="llm")
+        self.run_worker(lambda: self._translate_job(fresh), thread=True, exclusive=True, group="llm")
 
     def _translate_progress(self, done: int, total: int) -> None:
         self.busy_label = f"translating {done}/{total}"
 
-    def _translate_job(self) -> None:
+    def _translate_job(self, fresh: bool = False) -> None:
         try:
-            tr = self.session.translate(progress=self._translate_progress)
+            tr = self.session.translate(progress=self._translate_progress, fresh=fresh)
         except core.CoachError as exc:
             self.call_from_thread(self._translate_failed, str(exc))
             return

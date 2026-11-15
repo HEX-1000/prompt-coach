@@ -88,6 +88,38 @@ class CliTests(unittest.TestCase):
         self.assertIn("Showing the original prompt instead", out)
         self.assertEqual(self.copied, [TEXT])
 
+    # ---- project context block
+
+    BRIEF = "Demo exports weekly reports."
+
+    def project(self):
+        folder = self.tmp / "contexts"
+        folder.mkdir()
+        (folder / "demo.md").write_text(
+            f"---\nname: Demo\n---\n# Demo\n\n{self.BRIEF}\n\n## Glossary\n- E1: first export\n", encoding="utf-8")
+
+    def test_the_project_brief_is_attached_and_reported(self):
+        self.project()
+        code, out = self.run_cli([TEXT, "--project", "demo"], lambda v: self.fail("no translation call expected"))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.copied, [f"{TEXT}\n\nProje bağlamı (Demo):\n{self.BRIEF}"])
+        self.assertIn(f"project context attached: demo.md, {len(self.BRIEF)} characters (--no-brief leaves it out)", out)
+
+    def test_no_brief_leaves_the_block_out(self):
+        self.project()
+        code, out = self.run_cli([TEXT, "--project", "demo", "--no-brief"],
+                                 lambda v: self.fail("no translation call expected"))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.copied, [TEXT])
+        self.assertNotIn("project context attached", out)
+        self.assertNotIn("Proje bağlamı", out)
+
+    def test_the_translated_prompt_keeps_the_brief_as_written(self):
+        self.project()
+        code, out = self.run_cli([TEXT, "--project", "demo", "--lang", "English"], lambda v: TRANSLATED)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.copied, [f"{TRANSLATED}\n\nProject context (Demo):\n{self.BRIEF}"])
+
 
 if __name__ == "__main__":
     unittest.main()

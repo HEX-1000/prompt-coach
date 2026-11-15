@@ -37,11 +37,27 @@ def answer_state(answer: str) -> str:
     return "skipped" if not a else ("left" if a == "!" else "answered")
 
 
+def without_brief(final: str, brief_chars: int) -> str:
+    """final without the project context block (2.1.0 and later).
+
+    Code attaches that block and no model writes it, so the checks below leave it out. Its label
+    holds one of the leak phrases, and its length would hide a shortened text in the ratio."""
+    if not brief_chars:
+        return final
+    at = max(final.rfind("\n\n" + label) for label in ct.CONTEXT_LABELS)  # the block follows the text
+    line_end = final.find("\n", at + 2) if at >= 0 else -1
+    if line_end < 0:
+        return final
+    return final[:at] + final[line_end + 1 + brief_chars:]
+
+
 def score_saved(record: dict) -> dict:
     """Score result.final_prompt against original. No model call."""
     original = record.get("original", "")
     result = record.get("result") or {}
-    final = result.get("final_prompt", "")
+    built = result.get("final_prompt", "")
+    brief_chars = result.get("brief_chars") or 0
+    final = without_brief(built, brief_chars)
     fmt = record.get("format", 1)
 
     text_lang = ct.guess_language(original)
@@ -68,6 +84,7 @@ def score_saved(record: dict) -> dict:
         "context": record.get("context"),
         "original_chars": len(original),
         "final_chars": len(final),
+        "brief_chars": brief_chars,
         "length_ratio": round(len(final) / len(original), 2) if original else 0.0,
         "lang_text": text_lang,
         "lang_asked": asked,
@@ -89,7 +106,7 @@ def score_saved(record: dict) -> dict:
         row["seconds_per_call"] = [c.get("seconds") for c in calls]
         row["tokens_per_call"] = [[c.get("prompt_tokens"), c.get("output_tokens")] for c in calls]
         copied = record.get("copied")
-        row["copied_differs"] = None if not copied else copied.get("text") != final
+        row["copied_differs"] = None if not copied else copied.get("text") != built
     return row
 
 

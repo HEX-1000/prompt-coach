@@ -4,6 +4,15 @@ What changed in each version, newest first. After an update the app shows the en
 between your old version and the new one. Keep each entry to one short line a user can
 understand. The version number lives in `VERSION`; raising it is what makes an update reach everyone.
 
+## Unreleased
+
+- With a project selected, the final prompt carries the project's brief under "Project context". The brief is the text above the glossary in your project file, so check what yours says.
+- `b` on the result screen removes the brief or adds it again and copies the result. The choice is remembered per project. The plain terminal version has `--no-brief`.
+- `brief:` in a project file points to a brief kept in the project's own folder, for example `docs/BRIEF.md`. It is read fresh on every run.
+- A brief longer than 2,000 characters is cut at a paragraph break, with a warning. The limit is `brief_max_chars` in `config.json`.
+- A part that was translated once is not sent to the model again in the same run. `t` still translates everything again.
+- `prompt_coach_v1.py`, the first single-stage script, is no longer shipped.
+
 ## 2.0.0
 
 - One model call instead of several: the coach restates what you mean and asks up to 3 questions. It no longer rewrites your text.

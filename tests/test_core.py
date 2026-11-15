@@ -42,8 +42,8 @@ class TempDirCase(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
         return path
 
-    def session(self, text, data, context=None, cfg=None):
-        s = core.CoachSession(cfg or self.cfg, text, context, "test-model")
+    def session(self, text, data, context=None, cfg=None, **kwargs):
+        s = core.CoachSession(cfg or self.cfg, text, context, "test-model", **kwargs)
         with mock.patch.object(core, "chat_json", return_value=(data, STATS)) as m:
             s.understand()
         self.chat = m
@@ -85,6 +85,7 @@ class ConfigTests(TempDirCase):
     def test_new_defaults(self):
         cfg = core.load_config(self.tmp / "missing.json")
         self.assertEqual((cfg["num_ctx"], cfg["max_questions"], cfg["target"]), (8192, 3, "claude"))
+        self.assertEqual(cfg["brief_max_chars"], 2000)
         self.assertNotIn("rules_file", cfg)
         self.assertNotIn("temperature_compose", cfg)
 
@@ -343,6 +344,166 @@ class BuildTests(TempDirCase):
         self.assertEqual(s.build().final_prompt, f"Keep this {EM} exactly.")
 
 
+class BriefTests(TempDirCase):
+    BRIEF = "Proj exports weekly reports."
+    BODY = f"# Proj\n\n{BRIEF}\n\n## Glossary\n- E1: first export\n"
+
+    def context(self, front="name: Proj\n", body=BODY):
+        return core.parse_context_file(self.write("contexts/proj.md", f"---\n{front}---\n{body}"))
+
+    def with_file(self, text="Now at stage two.\n", body="## Glossary\n- E1: first export\n", extra=""):
+        brief = self.write("project/BRIEF.md", text, binary=isinstance(text, bytes))
+        return self.context(f"name: Proj\nbrief: {brief}\n{extra}", body), brief
+
+    # ---- the context file
+
+    def test_front_matter_brief_key(self):
+        ctx = self.context("name: Proj\nbrief: docs/BRIEF.md\ninclude:\n  - a.md\n")
+        self.assertEqual(ctx.brief_path, self.tmp / "contexts" / "docs" / "BRIEF.md")  # like an include path
+        self.assertEqual([p.name for p in ctx.includes], ["a.md"])
+        self.assertIsNone(self.context().brief_path)
+        ctx, brief = self.with_file()  # an absolute path, on Windows with a drive colon in it
+        self.assertEqual(ctx.brief_path, brief)
+
+    def test_without_a_brief_key_the_body_above_the_glossary_is_the_brief(self):
+        ctx = self.context()
+        self.assertEqual(ctx.brief(2000), (self.BRIEF, ctx.path, []))
+
+    def test_the_brief_file_is_read_without_comments_and_byte_order_mark(self):
+        ctx, brief = self.with_file("\ufeff<!-- kept current by the project -->\n# Brief\n\nNow at stage two.\n",
+                                    body=self.BODY)
+        self.assertEqual(ctx.brief(2000), ("# Brief\n\nNow at stage two.", brief, []))
+
+    def test_a_missing_brief_file_warns_and_the_body_is_used(self):
+        missing = self.tmp / "nope.md"
+        ctx = self.context(f"name: Proj\nbrief: {missing}\n")
+        self.assertEqual(ctx.brief(2000), (self.BRIEF, ctx.path, [f"brief not found: {missing}"]))
+
+    def test_an_unreadable_brief_file_warns_and_the_body_is_used(self):
+        ctx, brief = self.with_file(b"\xff\xfeN\x00o\x00w\x00", body=self.BODY)  # UTF-16, not UTF-8
+        text, source, warnings = ctx.brief(2000)
+        self.assertEqual((text, source), (self.BRIEF, ctx.path))
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0].startswith(f"cannot read {brief}: "), warnings[0])
+
+    def test_an_empty_brief_file_means_no_brief(self):
+        ctx, brief = self.with_file("<!-- nothing yet -->\n", body=self.BODY)
+        self.assertEqual(ctx.brief(2000), ("", brief, []))
+
+    def test_a_long_brief_is_cut_at_an_empty_line_with_a_warning(self):
+        ctx = self.context(body="First paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n\n## Glossary\n")
+        text, _, warnings = ctx.brief(40)
+        self.assertEqual(text, "First paragraph.\n\nSecond paragraph.")
+        self.assertEqual(warnings, ["brief cut to 35 characters"])
+        text, _, warnings = ctx.brief(10)
+        self.assertEqual((text, warnings), ("First para", ["brief cut to 10 characters"]))
+
+    def test_render_puts_the_brief_file_after_the_body_and_before_the_includes(self):
+        self.write("contexts/inc.md", "Included text.\n")
+        ctx, _ = self.with_file(extra="include: inc.md\n")
+        text, warnings = ctx.render(12000)
+        self.assertEqual(warnings, [])
+        self.assertEqual(text, "## Glossary\n- E1: first export\n\n"
+                               "--- project brief: BRIEF.md ---\nNow at stage two.\n\n"
+                               "--- included file: inc.md ---\nIncluded text.")
+
+    def test_render_reads_a_brief_file_that_is_also_an_include_once(self):
+        brief = self.write("project/BRIEF.md", "Now at stage two.\n")
+        ctx = self.context(f"name: Proj\nbrief: {brief}\ninclude: {brief}\n")
+        text, warnings = ctx.render(12000)
+        self.assertEqual((text.count("Now at stage two."), warnings), (1, []))
+        self.assertNotIn("included file", text)
+
+    def test_render_warns_about_a_missing_brief_file(self):
+        missing = self.tmp / "nope.md"
+        text, warnings = self.context(f"name: Proj\nbrief: {missing}\n").render(12000)
+        self.assertEqual(warnings, [f"brief not found: {missing}"])
+        self.assertNotIn("project brief", text)
+
+    def test_render_without_a_brief_key_is_unchanged(self):
+        text, warnings = self.context().render(12000)
+        self.assertEqual((text, warnings), (self.BODY.strip(), []))
+
+    # ---- the session
+
+    def test_the_brief_is_attached_by_default(self):
+        s = self.session("Shorten the report.", reply(), context=self.context())
+        res = s.build()
+        self.assertEqual((s.attach_brief, s.brief_text, s.brief_source), (True, self.BRIEF, "proj.md"))
+        self.assertRegex(s.brief_date, r"^\d{4}-\d\d-\d\d$")
+        self.assertEqual(res.final_prompt, f"Shorten the report.\n\nProject context (Proj):\n{self.BRIEF}")
+        self.assertEqual((res.brief_chars, res.brief_source), (len(self.BRIEF), "proj.md"))
+
+    def test_the_block_comes_after_the_answers_and_before_the_terms(self):
+        s = self.session("Compare E1 with the report.", reply(questions=[q("Which report?")]), context=self.context())
+        s.round.questions[0].answer = "the weekly one"
+        self.assertEqual(s.build().final_prompt,
+                         "Compare E1 with the report.\n\n"
+                         "Questions I was asked about this request, and my answers:\n"
+                         "- Q: Which report?\n  A: the weekly one\n\n"
+                         f"Project context (Proj):\n{self.BRIEF}\n\n"
+                         "Project terms:\n- E1: first export")
+
+    def test_the_label_follows_the_language_of_the_text(self):
+        s = self.session("Bu raporu kısalt, lütfen çok kısa olsun.", reply(), context=self.context())
+        self.assertTrue(s.build().final_prompt.endswith(f"\n\nProje bağlamı (Proj):\n{self.BRIEF}"))
+
+    def test_attach_brief_false_leaves_it_out_and_it_can_be_switched_on(self):
+        s = self.session("Shorten the report.", reply(), context=self.context(), attach_brief=False)
+        res = s.build()
+        self.assertEqual(res.final_prompt, "Shorten the report.")
+        self.assertEqual((res.brief_chars, res.brief_source), (0, ""))
+        self.assertEqual(s.brief_text, self.BRIEF)  # read anyway, so a key can switch it on
+        s.attach_brief = True
+        with mock.patch.object(core, "chat_json", side_effect=AssertionError("no call expected")):
+            res = s.build()
+        self.assertIn("Project context (Proj):", res.final_prompt)
+        self.assertEqual(res.brief_chars, len(self.BRIEF))
+
+    def test_the_brief_file_is_used_when_there_is_one(self):
+        ctx, _ = self.with_file(body=self.BODY)
+        s = self.session("Shorten the report.", reply(), context=ctx)
+        res = s.build()
+        self.assertEqual(res.final_prompt, "Shorten the report.\n\nProject context (Proj):\nNow at stage two.")
+        self.assertEqual((res.brief_chars, res.brief_source), (len("Now at stage two."), "BRIEF.md"))
+
+    def test_no_block_without_a_project_or_without_brief_text(self):
+        s = self.session("Text.", reply())
+        self.assertEqual((s.brief_text, s.brief_source, s.brief_date), ("", "", ""))
+        self.assertEqual(s.build().final_prompt, "Text.")
+        s = self.session("Text.", reply(), context=self.context(body="## Glossary\n- E1: first export\n"))
+        res = s.build()
+        self.assertEqual((s.brief_text, res.final_prompt, res.brief_chars, res.brief_source), ("", "Text.", 0, ""))
+
+    def test_brief_warnings_join_the_session_warnings_once(self):
+        missing = self.tmp / "nope.md"
+        s = core.CoachSession(self.cfg, "Text.", self.context(f"name: Proj\nbrief: {missing}\n"), "m")
+        self.assertEqual(s.warnings, [f"brief not found: {missing}"])  # render() and brief() both report it
+        self.assertEqual(s.brief_text, self.BRIEF)
+
+    def test_the_limit_comes_from_the_config(self):
+        s = core.CoachSession({**self.cfg, "brief_max_chars": 10}, "Text.", self.context(), "m")
+        self.assertEqual((s.brief_text, s.warnings), ("Proj expor", ["brief cut to 10 characters"]))
+
+    def test_the_model_reads_the_brief_file_and_its_codes_count_as_known(self):
+        ctx, _ = self.with_file("E9 is the ninth export.\n")
+        s = self.session("Look at E9.", reply(), context=ctx)
+        self.assertEqual(s.round.questions, [])  # no term check
+        system = self.chat.call_args.args[2][0]["content"]
+        self.assertIn("--- project brief: BRIEF.md ---\nE9 is the ninth export.", system)
+
+    def test_the_record_holds_the_length_and_the_source(self):
+        s = self.session("Shorten the report.", reply(), context=self.context())
+        s.build()
+        rec = json.loads(s.save().read_text(encoding="utf-8"))
+        self.assertEqual(rec["format"], 2)
+        self.assertEqual((rec["result"]["brief_chars"], rec["result"]["brief_source"]), (len(self.BRIEF), "proj.md"))
+        s.attach_brief = False
+        s.build()
+        rec = json.loads(s.save().read_text(encoding="utf-8"))
+        self.assertEqual((rec["result"]["brief_chars"], rec["result"]["brief_source"]), (0, ""))
+
+
 class GlossaryTests(TempDirCase):
     def context(self, raw=None):
         raw = raw if raw is not None else "---\nname: P\n---\n## Glossary\n- E1: first\n"
@@ -421,7 +582,9 @@ class HistoryTests(TempDirCase):
                                              "answer": "one page", "source": "model", "term": ""}])
         self.assertEqual(rnd["stats"], {"prompt_tokens": 700, "output_tokens": 200, "seconds": 9.5,
                                         "gen_seconds": 7.0, "num_ctx": 8192})
-        self.assertEqual(set(rec["result"]), {"final_prompt", "depth", "model", "effort", "terms", "notes"})
+        self.assertEqual(set(rec["result"]), {"final_prompt", "depth", "model", "effort", "terms", "notes",
+                                              "brief_chars", "brief_source"})
+        self.assertEqual((rec["result"]["brief_chars"], rec["result"]["brief_source"]), (0, ""))
         self.assertIsNone(rec["translation"])
         self.assertIsNone(rec["copied"])
         self.assertTrue(rec["result"]["final_prompt"].startswith(rec["original"]))
@@ -612,6 +775,91 @@ class TranslateTests(TempDirCase):
             with self.assertRaises(core.CoachError):
                 s.translate()
         self.assertIsNone(s.translation)
+
+    # ---- the cache
+
+    OK = "Shorten this report and write the result into the 13.049 line table."
+
+    def good(self, parts):
+        return {k: (self.OK if "13.049" in v else "Keep it short.") for k, v in parts.items()}
+
+    def test_a_second_translate_makes_no_call(self):
+        s = self.built(note="Kısa tut.")
+        calls = []
+        self.assertFalse(s.translation_cached())
+        with mock.patch.object(core, "chat_json", self.fake(calls, self.good)):
+            first = s.translate()
+            self.assertTrue(s.translation_cached())
+            second = s.translate()
+        self.assertEqual(len(calls), 1)
+        self.assertIsNot(second, first)
+        self.assertEqual((second.text, second.parts, second.kept), (first.text, 2, []))
+        self.assertEqual(len(second.stats), 1)  # the one call this session made
+
+    def test_fresh_sends_every_part_again(self):
+        s = self.built(note="Kısa tut.")
+        calls = []
+        with mock.patch.object(core, "chat_json", self.fake(calls, self.good)):
+            s.translate()
+            tr = s.translate(fresh=True)
+        self.assertEqual(calls, [{"1": self.TEXT, "2": "Kısa tut."}] * 2)
+        self.assertEqual(len(tr.stats), 2)
+
+    def test_after_a_new_build_only_the_new_part_is_sent(self):
+        s = self.built()
+        calls = []
+        with mock.patch.object(core, "chat_json", self.fake(calls, self.good)):
+            s.translate()
+            s.set_note("Kısa tut.")
+            s.build()
+            self.assertFalse(s.translation_cached())
+            tr = s.translate()
+        self.assertEqual(calls, [{"1": self.TEXT}, {"2": "Kısa tut."}])
+        self.assertEqual(tr.text, self.OK + "\n\nNote: Keep it short.")
+        self.assertEqual((tr.parts, len(tr.stats)), (2, 2))
+
+    def test_a_part_kept_in_the_source_language_is_not_sent_again(self):
+        s = self.built()
+        calls = []
+        with mock.patch.object(core, "chat_json", self.fake(calls, lambda p: {k: "Shorten this." for k in p})):
+            s.translate()
+            self.assertTrue(s.translation_cached())
+            tr = s.translate()
+            self.assertEqual(len(calls), 2)  # the batch and the second try, both from the first run
+            self.assertEqual((tr.text, tr.kept[0]["index"]), (self.TEXT, 1))
+            self.assertIn("numbers missing", tr.kept[0]["problems"])
+            s.translate(fresh=True)
+        self.assertEqual(len(calls), 4)
+
+    def test_the_cache_is_per_output_language(self):
+        s = self.built(text="Please shorten this report and keep the 13.049 line table as it is.", lang="Turkish")
+        calls = []
+        turkish = "Lütfen bu raporu kısalt ve 13.049 satırlık tabloyu olduğu gibi bırak."
+        with mock.patch.object(core, "chat_json", self.fake(calls, lambda p: {k: turkish for k in p})):
+            s.translate()
+            s.out_lang = "same"
+            self.assertFalse(s.translation_cached())
+            s.out_lang = "Turkish"
+            self.assertTrue(s.translation_cached())
+        self.assertEqual(len(calls), 1)
+
+    def test_switching_the_brief_costs_no_call_and_the_brief_is_not_translated(self):
+        brief = "Proj exports weekly reports."
+        path = self.write("c.md", f"---\nname: Proj\n---\n# Proj\n\n{brief}\n\n## Glossary\n- E1: first export\n")
+        s = self.session(self.TEXT, reply(), context=core.parse_context_file(path))
+        s.out_lang = "English"
+        s.build()
+        calls = []
+        with mock.patch.object(core, "chat_json", self.fake(calls, self.good)):
+            attached = s.translate()
+            s.attach_brief = False
+            s.build()
+            self.assertTrue(s.translation_cached())
+            removed = s.translate()
+        self.assertEqual(calls, [{"1": self.TEXT}])
+        self.assertEqual(attached.text, f"{self.OK}\n\nProject context (Proj):\n{brief}")  # English label
+        self.assertEqual(removed.text, self.OK)
+        self.assertTrue(s.result.final_prompt.endswith("olsun."))
 
 
 if __name__ == "__main__":

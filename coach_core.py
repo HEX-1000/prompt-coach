@@ -3,10 +3,12 @@
 One model call, then code builds the prompt:
   understand: restate what the user means, ask up to a few questions, label the depth.
   build: the user's text unchanged, then the note, the answers, the questions left to
-  the assistant and the glossary lines of the terms that occur. No model call.
+  the assistant, the project brief and the glossary lines of the terms that occur.
+  No model call.
 
-Context sources: a per-project context file (contexts/*.md) with a glossary and optional
-include paths (for example a project's CLAUDE.md or STATE.md).
+Context sources: a per-project context file (contexts/*.md) with a short brief, a glossary,
+an optional brief path (a brief kept in the project's own folder) and optional include paths
+(for example a project's CLAUDE.md).
 
 Standard library only. The coach itself talks only to Ollama on localhost. The one other network
 use is the launch-time update check in coach_update.py, which can be turned off.
@@ -28,7 +30,8 @@ from urllib.parse import urlparse
 
 from coach_text import (  # noqa: F401  (CODE_RE, COMMON_CODES, unknown_codes stay importable from here)
     CODE_RE, COMMON_CODES, GlossaryEntry, add_glossary_line, assemble, attached_terms,
-    check_part, guess_language, one_line, parse_glossary, render, split_parts, unknown_codes,
+    brief_from_body, check_part, clean_brief, cut_brief, guess_language, one_line, parse_glossary,
+    render, split_parts, unknown_codes,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -44,6 +47,8 @@ DEFAULT_CONFIG = {
     "contexts_dir": "contexts",
     "history_dir": "history",
     "include_max_chars": 12000,
+    # The project brief that is attached to the final prompt is cut to this length.
+    "brief_max_chars": 2000,
     "max_questions": 3,
     # A file name under targets/ (without .json), or an object of the same shape.
     "target": "claude",
@@ -140,12 +145,48 @@ class ProjectContext:
     path: Path
     body: str
     includes: list[Path] = field(default_factory=list)
+    brief_path: Path | None = None
+
+    def _brief_file(self) -> tuple[str | None, list[str]]:
+        """(the brief file's text without comments, warnings). The text is None without a readable file."""
+        if self.brief_path is None:
+            return None, []
+        if not self.brief_path.exists():
+            return None, [f"brief not found: {self.brief_path}"]
+        try:
+            return clean_brief(self.brief_path.read_text(encoding="utf-8-sig")), []
+        except (OSError, UnicodeDecodeError) as exc:
+            return None, [f"cannot read {self.brief_path}: {exc}"]
+
+    def brief(self, max_chars: int) -> tuple[str, Path, list[str]]:
+        """The project brief for the final prompt: (text, the file it comes from, warnings).
+
+        The brief file when it can be read. Otherwise the body of this file without its title
+        line and its glossary. The text is empty when there is nothing to attach."""
+        text, warnings = self._brief_file()
+        source = self.brief_path
+        if text is None or source is None:
+            text, source = brief_from_body(self.body), self.path
+        text, was_cut = cut_brief(text, max_chars)
+        if was_cut:
+            warnings.append(f"brief cut to {len(text)} characters")
+        return text, source, warnings
 
     def render(self, max_chars: int) -> tuple[str, list[str]]:
-        """Glossary body plus included files. Returns (text, warnings)."""
+        """What the local model reads: the body, the brief file, then the included files.
+
+        The brief file comes before the includes, so a context cut never removes it first.
+        Returns (text, warnings)."""
         parts = [self.body.strip()]
-        warnings = []
+        brief, warnings = self._brief_file()
+        if brief and self.brief_path:
+            if len(brief) > max_chars:
+                warnings.append(f"{self.brief_path.name} cut to {max_chars} characters")
+                brief = brief[:max_chars]
+            parts.append(f"--- project brief: {self.brief_path.name} ---\n{brief.strip()}")
         for inc in self.includes:
+            if inc == self.brief_path:  # already read as the brief
+                continue
             if not inc.exists():
                 warnings.append(f"include not found: {inc}")
                 continue
@@ -194,12 +235,17 @@ def parse_context_file(path: Path) -> ProjectContext:
 
         ---
         name: Token Optimization System
+        brief: D:\\Projects\\Token Optimization System\\docs\\BRIEF.md
         include:
-          - D:\\Projects\\Claude Token Optimizer\\CLAUDE.md
+          - D:\\Projects\\Token Optimization System\\CLAUDE.md
         ---
+
+    brief: one path to a short brief kept in the project's own folder. Without it the brief is
+    the body of this file without its title line and its glossary.
     """
     raw = path.read_text(encoding="utf-8")
     name, includes, body = path.stem, [], raw
+    brief_path = None
     lines = raw.splitlines()
     if lines and lines[0].strip() == "---":
         try:
@@ -215,6 +261,11 @@ def parse_context_file(path: Path) -> ProjectContext:
                 if stripped.lower().startswith("name:"):
                     name = stripped.split(":", 1)[1].strip().strip('"')
                     in_include = False
+                elif stripped.lower().startswith("brief:"):
+                    rest = stripped.split(":", 1)[1].strip()
+                    in_include = False
+                    if rest:
+                        brief_path = resolve(rest, path.parent)
                 elif stripped.lower().startswith("include:"):
                     rest = stripped.split(":", 1)[1].strip()
                     in_include = not rest
@@ -223,7 +274,8 @@ def parse_context_file(path: Path) -> ProjectContext:
                 elif in_include and stripped.startswith("-"):
                     includes.append(resolve(stripped[1:], path.parent))
             body = "\n".join(lines[end + 1:])
-    return ProjectContext(key=path.stem, name=name, path=path, body=body, includes=includes)
+    return ProjectContext(key=path.stem, name=name, path=path, body=body, includes=includes,
+                          brief_path=brief_path)
 
 
 def list_contexts(cfg: dict) -> list[ProjectContext]:
@@ -422,14 +474,18 @@ class Result:
     effort: str
     terms: list[str]   # keys of the glossary lines attached to the prompt
     notes: list[str]
+    brief_chars: int = 0     # length of the project brief in the prompt; 0 when it is not attached
+    brief_source: str = ""   # name of the file the brief comes from; "" when it is not attached
 
 
 @dataclass
 class Translation:
     language: str                  # "English" or "Turkish"
     text: str                      # the whole final prompt in that language
-    parts: int                     # parts that were sent to the model
+    parts: int                     # parts that needed a translation
     kept: list[dict] = field(default_factory=list)   # [{"index": n, "problems": [...]}]
+    # One entry per translation call the session has made so far. A translation that comes
+    # from the session's cache adds none.
     stats: list[CallStats] = field(default_factory=list)
 
 
@@ -450,34 +506,51 @@ def _app_version() -> str:
         return ""
 
 
+def _file_date(path: Path) -> str:
+    """The day a file was last changed, as 2026-11-15; '' when the file cannot be looked at."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
 class CoachSession:
     """Holds one run. UI code calls the methods in order:
 
-        s = CoachSession(cfg, text, context, model, out_lang)
+        s = CoachSession(cfg, text, context, model, out_lang, attach_brief=True)
         rnd = s.understand()          # the one model call
         ... fill rnd.questions[i].answer, then s.set_note("...")
         res = s.build()               # no model call
-        if s.needs_translation(): s.translate(progress)   # model calls, section 9
+        if s.needs_translation(): s.translate(progress)   # model calls for parts not translated yet
         s.new_terms()                 # [(code, answer)] not yet in the glossary
         s.save_terms()                # writes them, returns the codes written
         s.mark_copied(text)           # remembers what was copied; call save() after it
         s.save()                      # writes the history record; later calls rewrite the same file
+
+    The project brief: brief_text, brief_source (a file name) and brief_date are read once, here.
+    attach_brief says whether build() and translate() put it into the prompt. To switch, set
+    attach_brief and call build() again; translate() then takes every part from the cache.
     """
 
     def __init__(self, cfg: dict, text: str, context: ProjectContext | None,
-                 model: str, out_lang: str = "same"):
+                 model: str, out_lang: str = "same", attach_brief: bool = True):
         self.cfg = cfg
         self.text = text.strip()
         self.context = context
         self.model = model
         self.out_lang = out_lang
+        self.attach_brief = attach_brief
         self.target = load_target(cfg)
         self.text_lang = guess_language(self.text)
         self.entries: list[GlossaryEntry] = parse_glossary(context.body) if context else []
         self.warnings: list[str] = []
         self._known_text = ""
+        self.brief_text = self.brief_source = self.brief_date = ""
         if context:
             self._known_text, self.warnings = context.render(cfg["include_max_chars"])
+            self.brief_text, source, brief_warnings = context.brief(cfg["brief_max_chars"])
+            self.brief_source, self.brief_date = source.name, _file_date(source)
+            self.warnings += [w for w in brief_warnings if w not in self.warnings]
         self.context_text = self._fit_context()
         self.round: Round | None = None
         self.result: Result | None = None
@@ -485,6 +558,10 @@ class CoachSession:
         self.copied: dict | None = None
         self._path: Path | None = None
         self._time = ""
+        # Translation results of this session: (language code, source part) -> (output, problems).
+        # A part that failed its checks twice is kept as (source part, problems).
+        self._translated: dict[tuple[str, str], tuple[str, list[str]]] = {}
+        self._translate_stats: list[CallStats] = []
 
     # ---- stage 1
 
@@ -567,15 +644,25 @@ class CoachSession:
     def _label_lang(self) -> str:
         return self.text_lang
 
+    def _brief(self) -> str:
+        """The brief that goes into the prompt now: '' when it is switched off or there is none."""
+        return self.brief_text if self.attach_brief and self.context else ""
+
+    def _segments(self, lang: str) -> list[tuple[str, str]]:
+        rnd = self.round
+        return assemble(self.text, rnd.questions, rnd.note, self.entries, lang,
+                        brief=self._brief(), project=self.context.name if self.context else "")
+
     def build(self) -> Result:
         """The final prompt, built in code. No model call."""
         if not self.round:
             raise CoachError("The model has not been asked yet.")
         rnd = self.round
         self.translation = None  # a new build makes an old translation stale
-        segments = assemble(self.text, rnd.questions, rnd.note, self.entries, self._label_lang())
+        segments = self._segments(self._label_lang())
         depth = rnd.depth if rnd.depth in DEPTHS else "standard"
         pick = self.target["depths"][depth]
+        brief = self._brief()
         self.result = Result(
             final_prompt=render(segments),
             depth=depth,
@@ -583,6 +670,8 @@ class CoachSession:
             effort=pick.get("effort", ""),
             terms=[e.key for e in attached_terms(self.text, rnd.note, rnd.questions, self.entries)],
             notes=[],
+            brief_chars=len(brief),
+            brief_source=self.brief_source if brief else "",
         )
         return self.result
 
@@ -612,21 +701,14 @@ class CoachSession:
             out[k] = value
         return out
 
-    def translate(self, progress=None) -> Translation:
-        """Translate the final prompt into the output language. Model calls; may raise CoachError.
+    def _translation_plan(self, code: str) -> tuple[list[tuple[str, str]], dict[str, str]]:
+        """(layout, sources) of the prompt with the labels of language code.
 
-        progress(done, total) is called after each batch."""
-        code = LANG_CODES.get(self.out_lang)
-        if not code:
-            raise CoachError("The output language is 'same', so there is nothing to translate.")
-        if not self.round:
-            raise CoachError("The model has not been asked yet.")
-        rnd = self.round
-        segments = assemble(self.text, rnd.questions, rnd.note, self.entries, code)
-
-        layout: list[tuple[str, str]] = []   # ("fixed", text) or ("part", key)
-        sources: dict[str, str] = {}         # key -> source part, only the parts that are sent
-        for kind, text in segments:
+        layout: ("fixed", text) or ("part", key), in order. sources: key -> a part that needs a
+        translation. Fixed segments (labels, glossary lines, the project brief) are never sent."""
+        layout: list[tuple[str, str]] = []
+        sources: dict[str, str] = {}
+        for kind, text in self._segments(code):
             if kind != "user":
                 layout.append(("fixed", text))
                 continue
@@ -639,11 +721,36 @@ class CoachSession:
                     layout.append(("fixed", part))
                 if sep:
                     layout.append(("fixed", sep))
+        return layout, sources
+
+    def translation_cached(self) -> bool:
+        """True when translate() would make no model call: every part has a result in the cache."""
+        code = LANG_CODES.get(self.out_lang)
+        if not code or not self.round:
+            return False
+        _, sources = self._translation_plan(code)
+        return all((code, part) in self._translated for part in sources.values())
+
+    def translate(self, progress=None, fresh: bool = False) -> Translation:
+        """Translate the final prompt into the output language. May raise CoachError.
+
+        A part this session has translated before comes from the cache, so only new parts cost a
+        model call. With fresh=True every part is sent again. progress(done, total) is called
+        after each batch."""
+        code = LANG_CODES.get(self.out_lang)
+        if not code:
+            raise CoachError("The output language is 'same', so there is nothing to translate.")
+        if not self.round:
+            raise CoachError("The model has not been asked yet.")
+        layout, sources = self._translation_plan(code)
+        cache, stats = self._translated, self._translate_stats
 
         batches: list[dict[str, str]] = []
         current: dict[str, str] = {}
         size = 0
         for key, part in sources.items():
+            if not fresh and (code, part) in cache:
+                continue
             if current and size + len(part) > BATCH_LIMIT:
                 batches.append(current)
                 current, size = {}, 0
@@ -652,9 +759,6 @@ class CoachSession:
         if current:
             batches.append(current)
 
-        stats: list[CallStats] = []
-        done: dict[str, str] = {}
-        kept: list[dict] = []
         redo: list[str] = []
         for n, batch in enumerate(batches, 1):
             got = self._translate_call(batch, stats)
@@ -662,22 +766,24 @@ class CoachSession:
                 if check_part(source, got[key], self.text_lang):
                     redo.append(key)
                 else:
-                    done[key] = got[key]
+                    cache[(code, source)] = (got[key], [])
             if progress:
                 progress(n, len(batches))
         for key in redo:  # one more try, alone
             source = sources[key]
             out = self._translate_call({key: source}, stats)[key]
             problems = check_part(source, out, self.text_lang)
+            cache[(code, source)] = (source, problems) if problems else (out, [])
+
+        done: dict[str, str] = {}
+        kept: list[dict] = []
+        for key, source in sources.items():
+            done[key], problems = cache[(code, source)]
             if problems:
-                done[key] = source
                 kept.append({"index": int(key), "problems": problems})
-            else:
-                done[key] = out
-        kept.sort(key=lambda k: k["index"])
 
         text = "".join(done[v] if kind == "part" else v for kind, v in layout)
-        self.translation = Translation(self.out_lang, text, len(sources), kept, stats)
+        self.translation = Translation(self.out_lang, text, len(sources), kept, list(stats))
         return self.translation
 
     # ---- glossary

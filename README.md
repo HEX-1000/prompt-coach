@@ -22,9 +22,11 @@ How much a request costs depends mostly on two things: how many rounds it takes 
 
 1. **Write.** The app opens in **General Context**, ready to type. The empty prompt box lists the first keys to know. To use a project's glossary, press `tab` and pick the project from the **PROJECTS** list. Then type or paste your prompt and press `ctrl+s`.
 2. **Clarify.** One model call restates what you mean and asks up to 3 questions. Codes such as `D5` or `A02` that are not in the project glossary are always asked about, never guessed ("term check"). In a question field, type an answer, press Enter or leave it empty to skip, or type `!` (or press `ctrl+l`) to leave the question to the assistant. The note field takes anything you want to add or correct. `ctrl+s` builds the prompt.
-3. **Result.** The final prompt is your text unchanged, then your note, your answers, the questions left to the assistant and the glossary lines of the terms it uses. Code builds it, not the model, so nothing in your text is dropped or reworded. You also get the recommended Claude model and effort. The prompt is already on the clipboard; edit it in place and copy again with `y` or `ctrl+y`.
+3. **Result.** The final prompt is your text unchanged, then your note, your answers, the questions left to the assistant, the project brief and the glossary lines of the terms it uses. Code builds it, not the model, so nothing in your text is dropped or reworded. You also get the recommended Claude model and effort. The prompt is already on the clipboard; edit it in place and copy again with `y` or `ctrl+y`.
 
-If the output language (`f4`) differs from the language of your text, the prompt is translated part by part and every part is checked for dropped numbers, URLs and codes, and for a part left untranslated. `o` shows the original and `t` translates again. The checks cannot see a wrong idiom or a clause attached to the wrong noun, so read the translation before you send it. Leaving the language on `same` skips the translation.
+With a project selected, the prompt carries that project's brief under `Project context (name):`, so the assistant knows what the project is without being told in every prompt. `b` removes the brief or adds it again and copies the result; the choice is remembered per project. The brief is attached as you wrote it and is never translated.
+
+If the output language (`f4`) differs from the language of your text, the prompt is translated part by part and every part is checked for dropped numbers, URLs and codes, and for a part left untranslated. `o` shows the original and `t` translates again. A part that was translated once is not sent to the model a second time in the same run, so after you go back and change an answer only the new parts are translated; `t` sends all of them again. The checks cannot see a wrong idiom or a clause attached to the wrong noun, so read the translation before you send it. Leaving the language on `same` skips the translation.
 
 If you answered a term check and a project is selected, `g` adds the term to that project's glossary.
 
@@ -69,7 +71,9 @@ It creates a Python environment in `.venv` with [Textual](https://textual.textua
 
 At the end it checks that Ollama is installed and running and that one of the models in `config.json` is downloaded. Anything missing is listed under **Before you start**, with the command to fix it. These checks only warn; the app is installed either way. The installer uses the newest Python 3.10 or newer it finds: first the Python install manager's folder, then the `py` launcher, then `python` on PATH. If there is none, or the one it finds is older than 3.10, it stops with a link to the download.
 
-**5. Add a project context (optional).** Copy `contexts\_template.md` to a new file, for example `contexts\my-project.md`, and fill in the project name, a one-line description and a glossary of your own terms (a list under a `## Glossary` heading, one `- TERM: meaning` per line). The `name:` line is what the PROJECTS list shows. The coach reads the context before every run, so it knows what your abbreviations mean, and it attaches the glossary lines of the terms your prompt uses. Optional `include:` paths, such as a project's `CLAUDE.md`, are read fresh each time. Without any context file, General Context is all you see, and every project term gets asked about.
+**5. Add a project context (optional).** Copy `contexts\_template.md` to a new file, for example `contexts\my-project.md`, and fill in the project name, a short brief (what the project is, its goal, where it stands now) and a glossary of your own terms (a list under a `## Glossary` heading, one `- TERM: meaning` per line). The `name:` line is what the PROJECTS list shows. The coach reads the context before every run, so it knows what your abbreviations mean, and it attaches the glossary lines of the terms your prompt uses. Optional `include:` paths, such as a project's `CLAUDE.md`, are read fresh each time; only the local model reads them. Without any context file, General Context is all you see, and every project term gets asked about.
+
+The brief is the text of the project file without its title line, its glossary and its comments; in the template that is the paragraph above the glossary. It goes into every final prompt for that project, so write only what the assistant may read. Keep it under 2,000 characters: a longer brief is cut at a paragraph break, with a warning (the limit is `brief_max_chars` in `config.json`). If the project keeps a short description of its own, point the front matter key `brief:` at that file, for example `brief: D:\path\to\project\docs\BRIEF.md`. That file is then read fresh on every run and attached instead.
 
 **6. Start it** from the desktop shortcut, or open Windows Terminal and choose **Prompt Coach**.
 
@@ -86,6 +90,7 @@ At the end it checks that Ollama is installed and running and that one of the mo
 | `y` or `ctrl+y` | copy the result |
 | `o` | result: switch between the original and the translation |
 | `t` | result: translate again |
+| `b` | result: remove or add the project brief, and copy |
 | `g` | result: save answered term checks to the project glossary |
 | `esc` | back |
 | `f1` | all keys (`?` also works when the cursor is not in a text box) |
@@ -97,18 +102,17 @@ At the end it checks that Ollama is installed and running and that one of the mo
 |---|---|
 | `coach_tui.py` | the terminal app |
 | `coach_core.py` | shared logic: config, contexts, the session (understand, build, translate, save), clipboard |
-| `coach_text.py` | text functions without side effects: language guess, glossary, prompt assembly, translation checks |
+| `coach_text.py` | text functions without side effects: language guess, glossary, project brief, prompt assembly, translation checks |
 | `targets/claude.json` | which Claude model and effort go with each depth label |
 | `coach_update.py` | the launch-time update check, see [Updates](#updates) |
 | `VERSION` | the installed version, compared with the one on GitHub |
 | `CHANGELOG.md` | what changed in each version, newest first |
 | `tests/` | `python -B -m unittest discover -s tests`; GitHub runs them on Windows and Linux with Python 3.10 and 3.12 |
-| `prompt_coach.py` | plain terminal version, standard library only: `python -B prompt_coach.py --project my-project "your prompt"` |
-| `contexts/*.md` | one file per project; files starting with `_` are not listed |
+| `prompt_coach.py` | plain terminal version, standard library only: `python -B prompt_coach.py --project my-project "your prompt"`; `--no-brief` leaves the project brief out |
+| `contexts/*.md` | one file per project, with its brief and its glossary; files starting with `_` are not listed |
 | `rules/` | no longer used, see [rules/README.md](rules/README.md) |
 | `tools/replay.py` | local tool: scores saved history records and replays the pipeline on them (`--saved` needs no model) |
-| `config.json` | Ollama address, models, context size, temperature, question limit, target |
-| `prompt_coach_v1.py` | the earlier single-stage script, kept for comparison |
+| `config.json` | Ollama address, models, context size, temperature, question limit, brief length, target |
 
 ## Updates
 
@@ -126,7 +130,7 @@ Updating means running code downloaded from this repository, so the repository o
 
 ## Privacy
 
-The coach talks only to Ollama on `localhost`. The one other connection is the update check above: plain requests to `raw.githubusercontent.com` and `github.com`, with no prompt, context or history in them. Your contexts and history stay in this folder, and `.gitignore` keeps them out of Git if you fork the repository.
+The coach talks only to Ollama on `localhost`. The one other connection is the update check above: plain requests to `raw.githubusercontent.com` and `github.com`, with no prompt, context or history in them. Your contexts and history stay in this folder, and `.gitignore` keeps them out of Git if you fork the repository. The project brief and the glossary lines that the coach attaches are part of the final prompt, so they go wherever you paste that prompt.
 
 ## Limitations
 

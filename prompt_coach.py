@@ -5,11 +5,12 @@ Usage:
     python -B prompt_coach.py --file prompt.txt
     python -B prompt_coach.py                  (reads the clipboard)
     python -B prompt_coach.py --list           (lists project context files)
+    --no-brief                                 (leaves the project context block out of the prompt)
 
 One model call restates what you mean and asks a few questions. Answer each one (Enter
 skips, ! leaves it to the assistant), add an optional note, and the final prompt is built
-in code: your text unchanged, then the note, the answers and the project terms. It is
-printed and copied to the clipboard.
+in code: your text unchanged, then the note, the answers, the project brief and the project
+terms. It is printed and copied to the clipboard.
 Standard library only. Requires Ollama on localhost:11434.
 """
 import argparse
@@ -60,6 +61,8 @@ def main():
     ap.add_argument("--project", help="context file name without .md")
     ap.add_argument("--model", default=cfg["models"][0])
     ap.add_argument("--lang", default="same", choices=core.OUTPUT_LANGUAGES)
+    ap.add_argument("--no-brief", action="store_true",
+                    help="leave the project context block out of the final prompt")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
 
@@ -80,7 +83,8 @@ def main():
         return 1
 
     try:
-        session = core.CoachSession(cfg, text, pick_context(cfg, args.project), args.model, args.lang)
+        session = core.CoachSession(cfg, text, pick_context(cfg, args.project), args.model, args.lang,
+                                    attach_brief=not args.no_brief)
         for w in session.warnings:
             print(f"warning: {w}")
         rnd = session.understand()
@@ -100,6 +104,9 @@ def main():
         return 1
 
     print("\n" + depth_line(session, res))
+    if res.brief_chars:
+        print(f"project context attached: {res.brief_source}, {res.brief_chars:,} characters "
+              "(--no-brief leaves it out)")
     if res.terms:
         print(f"{len(res.terms)} project term(s) attached: " + ", ".join(res.terms))
     for n in res.notes:
