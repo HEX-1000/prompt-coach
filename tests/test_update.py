@@ -48,7 +48,11 @@ class Remote:
 
     @property
     def urls(self) -> dict:
-        return {"version_url": self.version_file.as_uri(), "zip_url": self.zip_file.as_uri()}
+        return {
+            "version_url": self.version_file.as_uri(),
+            "tag_version_url": self.version_file.as_uri(),
+            "zip_url": self.zip_file.as_uri(),
+        }
 
 
 class ZipUpdateTests(unittest.TestCase):
@@ -145,6 +149,50 @@ class ZipUpdateTests(unittest.TestCase):
         (self.tmp / "remote_VERSION").write_text("<html>404</html>", encoding="utf-8")
         res = up.check_and_update(self.app, version_url=(self.tmp / "remote_VERSION").as_uri(), zip_url="x")
         self.assertEqual(res.status, "failed")
+
+    def test_default_urls_point_at_the_tag(self):
+        self.assertEqual(
+            up.ZIP_URL.format(version="2.1.0"),
+            "https://github.com/HEX-1000/prompt-coach/archive/refs/tags/v2.1.0.zip",
+        )
+        self.assertEqual(
+            up.TAG_VERSION_URL.format(version="2.1.0"),
+            "https://raw.githubusercontent.com/HEX-1000/prompt-coach/v2.1.0/VERSION",
+        )
+
+    def test_check_finds_a_version_and_installs_nothing(self):
+        remote = self.new_remote()
+        res = up.check(self.app, version_url=remote.urls["version_url"], tag_version_url=remote.urls["tag_version_url"])
+        self.assertEqual((res.status, res.old, res.new), ("available", "1.0.0", "1.1.0"), res.message)
+        self.assertEqual((self.app / "VERSION").read_text().strip(), "1.0.0")
+        self.assertEqual((self.app / "coach_core.py").read_text(), "VALUE = 'old'\n")
+
+    def test_a_version_without_a_tag_is_not_offered(self):
+        remote = self.new_remote()
+        res = up.check_and_update(self.app, **{**remote.urls, "tag_version_url": (self.tmp / "no-tag").as_uri()})
+        self.assertEqual(res.status, "current")
+        self.assertEqual(res.message, "version 1.1.0 is not tagged yet")
+        self.assertEqual((self.app / "VERSION").read_text().strip(), "1.0.0")
+
+    def test_a_tag_with_another_version_fails(self):
+        remote = self.new_remote()
+        tagged = self.tmp / "tag_VERSION"
+        tagged.write_text("1.0.5\n", encoding="utf-8")
+        res = up.check(self.app, version_url=remote.urls["version_url"], tag_version_url=tagged.as_uri())
+        self.assertEqual(res.status, "failed")
+        self.assertIn("not 1.1.0", res.message)
+
+    def test_install_rejects_a_zip_with_another_version(self):
+        remote = self.new_remote(version="1.2.0")
+        res = up.install(self.app, "1.1.0", zip_url=remote.zip_file.as_uri())
+        self.assertEqual(res.status, "failed")
+        self.assertIn("not 1.1.0", res.message)
+        self.assertEqual((self.app / "VERSION").read_text().strip(), "1.0.0")
+
+    def test_install_takes_the_zip_of_the_given_version(self):
+        remote = self.new_remote()
+        res = up.install(self.app, "1.1.0", zip_url=remote.zip_file.as_uri())
+        self.assertEqual((res.status, res.new), ("updated", "1.1.0"), res.message)
 
     def test_syntax_error_in_download_writes_nothing(self):
         remote = self.new_remote(**{"coach_core.py": "def broken(:\n"})
@@ -299,10 +347,12 @@ class GitUpdateTests(unittest.TestCase):
         (seed / "CHANGELOG.md").write_text(CHANGELOG_TEXT)
         git(seed, "add", "-A")
         git(seed, "commit", "-q", "-m", "two")
-        git(seed, "push", "-q", str(self.origin), "main")
+        git(seed, "tag", "v1.1.0")
+        git(seed, "push", "-q", str(self.origin), "main", "v1.1.0")
         self.seed = seed
         self.kw = {
             "version_url": (seed / "VERSION").as_uri(),
+            "tag_version_url": (seed / "VERSION").as_uri(),
             "zip_url": (self.tmp / "unused.zip").as_uri(),
             "origin_match": "hex-1000-prompt-coach",
         }
@@ -314,6 +364,21 @@ class GitUpdateTests(unittest.TestCase):
         res = up.check_and_update(self.app, **self.kw)
         self.assertEqual((res.status, res.new), ("updated", "1.1.0"), res.message)
         self.assertEqual((self.app / "coach_core.py").read_text(), "VALUE = 2\n")
+
+    def test_a_commit_after_the_tag_is_not_installed(self):
+        (self.seed / "VERSION").write_text("1.2.0\n")
+        (self.seed / "coach_core.py").write_text("VALUE = 3\n")
+        git(self.seed, "commit", "-q", "-am", "three, not tagged")
+        git(self.seed, "push", "-q", str(self.origin), "main")
+        res = up.install(self.app, "1.1.0", origin_match=self.kw["origin_match"])
+        self.assertEqual((res.status, res.new), ("updated", "1.1.0"), res.message)
+        self.assertEqual((self.app / "coach_core.py").read_text(), "VALUE = 2\n")
+
+    def test_a_missing_tag_fails_and_changes_nothing(self):
+        res = up.install(self.app, "1.3.0", origin_match=self.kw["origin_match"])
+        self.assertEqual(res.status, "failed")
+        self.assertIn("v1.3.0", res.message)
+        self.assertEqual((self.app / "coach_core.py").read_text(), "VALUE = 1\n")
 
     def test_the_pull_brings_the_changelog(self):
         self.assertFalse((self.app / "CHANGELOG.md").exists())

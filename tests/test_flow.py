@@ -35,6 +35,12 @@ TR_BLOCK = f"\n\nProje bağlamı (Demo):\n{BRIEF}"
 @unittest.skipIf(coach_tui is None, "textual is not installed")
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        import coach_update  # the launch check must never reach the network in a test
+        from unittest import mock as _mock
+
+        _p = _mock.patch.object(coach_update, "check", lambda *a, **k: coach_update.UpdateResult("offline"))
+        _p.start()
+        self.addCleanup(_p.stop)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         (self.tmp / "contexts").mkdir()

@@ -11,6 +11,9 @@ understand. The version number lives in `VERSION`; raising it is what makes an u
 - `brief:` in a project file points to a brief kept in the project's own folder, for example `docs/BRIEF.md`. It is read fresh on every run.
 - A brief longer than 2,000 characters is cut at a paragraph break, with a warning. The limit is `brief_max_chars` in `config.json`.
 - A part that was translated once is not sent to the model again in the same run. `t` still translates everything again.
+- The update check runs in the background after the app starts, so an offline start no longer waits. When a version is available, the app says so and F6 installs it, restarts and keeps the text of your prompt box.
+- Updates come from release tags (`vX.Y.Z`). A version on `main` without a tag is not offered.
+- `auto_update` in `config.json` is now `true` (check and tell you, the default), `"install"` (install on launch, the old behaviour) or `false` (never check).
 - `prompt_coach_v1.py`, the first single-stage script, is no longer shipped.
 
 ## 2.0.0

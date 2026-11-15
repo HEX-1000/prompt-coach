@@ -116,15 +116,16 @@ The brief is the text of the project file without its title line, its glossary a
 
 ## Updates
 
-When the TUI starts, it reads one small file, `VERSION`, from this repository on GitHub. If the version there is newer than yours, it installs the new files and starts the new version. You see one line in the console and a notice in the app that lists what changed, taken from [CHANGELOG.md](CHANGELOG.md). The notice shows at most 5 lines and points to the file for the rest.
+After the TUI is up, it reads one small file, `VERSION`, from this repository on GitHub, in the background, so an offline start does not wait. A version counts as available only when its release tag `vX.Y.Z` exists and holds the same `VERSION`. The app then shows "Version X is available. F6 installs it and restarts." F6 stores the text in the prompt box, installs the version from the tag, starts the new version and puts the text back. The notice after the restart lists what changed, taken from [CHANGELOG.md](CHANGELOG.md). It shows at most 5 lines and points to the file for the rest. If the install fails, you get the reason and the old version keeps running.
 
 - Your `contexts/`, `rules/`, `history/`, `config.json` and `.state.json` are never touched. Replaced files are copied to `.update_backup/` first.
-- A ZIP download is updated from the repository ZIP. Every Python file is checked for syntax errors before anything is written.
-- A `git clone` of this repository is updated with `git pull --ff-only`, unless a tracked file other than `config.json` has local edits. Then it skips the update and tells you.
+- A ZIP download is updated from the ZIP of the release tag. Every Python file is checked for syntax errors before anything is written.
+- A `git clone` of this repository fetches the tag and merges it with `--ff-only`, unless a tracked file other than `config.json` has local edits. Then it skips the update and tells you.
+- A version on `main` that has no tag yet is not offered.
 - A clone of a fork is not updated.
 - If GitHub cannot be reached, nothing happens and the app starts as usual.
 
-To turn it off, add `"auto_update": false` to `config.json`. You can also run the check yourself with `python -B coach_update.py`.
+`auto_update` in `config.json` has three values: `true` (the default) checks and tells you, `"install"` installs on launch without asking, `false` does not check. You can also run the update yourself with `python -B coach_update.py`.
 
 Updating means running code downloaded from this repository, so the repository owner's GitHub account is trusted the same way it is when you first download the app. Versions before 1.1.0 have no update check. Run `git pull` or download the ZIP again once, and later updates come by themselves.
 

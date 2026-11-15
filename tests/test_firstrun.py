@@ -27,6 +27,12 @@ def notices(app):
 @unittest.skipIf(coach_tui is None, "textual is not installed")
 class FirstRunTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        import coach_update  # the launch check must never reach the network in a test
+        from unittest import mock as _mock
+
+        _p = _mock.patch.object(coach_update, "check", lambda *a, **k: coach_update.UpdateResult("offline"))
+        _p.start()
+        self.addCleanup(_p.stop)
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "contexts").mkdir()
         self._load_config = core.load_config
@@ -187,6 +193,109 @@ class FirstRunTests(unittest.IsolatedAsyncioTestCase):
         if text is not None:
             (folder / "CHANGELOG.md").write_text(text, encoding="utf-8")
         return folder
+
+    # ------------------------------------------------------------------ updater: notify, F6, auto_update
+
+    def available(self, version="2.1.0"):
+        import coach_update
+
+        return mock.patch.object(coach_update, "check",
+                                 lambda *a, **k: coach_update.UpdateResult("available", "2.0.0", version))
+
+    async def test_an_available_version_is_announced_without_installing(self):
+        self.ollama_has("qwen3.5:9b")
+        app = coach_tui.CoachApp()
+        with self.available(), mock.patch("coach_update.install") as install:
+            async with app.run_test(size=(120, 36)) as pilot:
+                await self.wait_for(pilot, lambda: app.update_version, "the update check")
+                self.assertIn("Version 2.1.0 is available. F6 installs it and restarts.",
+                              [m for _, m in notices(app)])
+                self.assertEqual(app.install_version, "")
+            install.assert_not_called()
+
+    async def test_f6_without_an_update_does_nothing(self):
+        self.ollama_has("qwen3.5:9b")
+        app = coach_tui.CoachApp()
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            await pilot.press("f6")
+            await pilot.pause()
+            self.assertEqual(app.install_version, "")
+            self.assertIn("No update is available.", [m for _, m in notices(app)])
+            self.assertNotIn("draft", coach_tui.load_state())
+
+    async def test_f6_keeps_the_draft_and_the_next_start_puts_it_back(self):
+        import json
+
+        self.ollama_has("qwen3.5:9b")
+        app = coach_tui.CoachApp()
+        with self.available():
+            async with app.run_test(size=(120, 36)) as pilot:
+                await self.wait_for(pilot, lambda: app.update_version, "the update check")
+                app.query_one("#prompt").load_text("Summarise the weekly report.")
+                await pilot.press("f6")
+                await pilot.pause()
+            self.assertEqual(app.install_version, "2.1.0")
+            stored = json.loads((self.tmp / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["draft"], "Summarise the weekly report.")
+            again = coach_tui.CoachApp()
+            async with again.run_test(size=(120, 36)) as pilot:
+                await pilot.pause()
+                self.assertEqual(again.query_one("#prompt").text, "Summarise the weekly report.")
+            self.assertNotIn("draft", json.loads((self.tmp / "state.json").read_text(encoding="utf-8")))
+
+    async def test_the_check_runs_only_when_auto_update_is_true(self):
+        import coach_update
+
+        self.ollama_has("qwen3.5:9b")
+        for value, expected in ((True, 1), ("install", 0), (False, 0)):
+            self.cfg["auto_update"] = value
+            calls = []
+            with mock.patch.object(coach_update, "check",
+                                   lambda *a, **k: calls.append(1) or coach_update.UpdateResult("current")):
+                app = coach_tui.CoachApp()
+                async with app.run_test(size=(120, 36)) as pilot:
+                    await pilot.pause(0.3)
+            self.assertEqual(len(calls), expected, repr(value))
+
+    def test_before_the_ui_only_install_installs(self):
+        import coach_update
+
+        for value, expected in ((True, 0), (False, 0), ("install", 1)):
+            self.cfg["auto_update"] = value
+            calls = []
+            with mock.patch.object(coach_update, "check_and_update",
+                                   lambda *a, **k: calls.append(1) or coach_update.UpdateResult("current")):
+                self.assertIsNone(coach_tui.auto_update())
+            self.assertEqual(len(calls), expected, repr(value))
+
+    def test_install_on_launch_restarts_the_new_copy(self):
+        import coach_update
+
+        self.cfg["auto_update"] = "install"
+        done = coach_update.UpdateResult("updated", "2.0.0", "2.1.0")
+        with mock.patch.object(coach_update, "check_and_update", lambda *a, **k: done), \
+                mock.patch.object(coach_tui, "relaunch", lambda label: 0):
+            self.assertEqual(coach_tui.auto_update(), 0)
+
+    def test_a_failed_f6_install_keeps_the_old_version_and_says_why(self):
+        import coach_update
+
+        failed = coach_update.UpdateResult("failed", "2.0.0", "2.1.0", "could not download the update: offline")
+        with mock.patch.object(coach_update, "install", lambda *a, **k: failed):
+            self.assertIsNone(coach_tui.install_requested("2.1.0"))
+        self.assertEqual(coach_tui.STARTUP_NOTES,
+                         [("Update check: could not download the update: offline. Still on 2.0.0.", "warning")])
+
+    def test_a_successful_f6_install_relaunches_with_the_versions(self):
+        import coach_update
+
+        done = coach_update.UpdateResult("updated", "2.0.0", "2.1.0")
+        labels = []
+        with mock.patch.object(coach_update, "install", lambda *a, **k: done), \
+                mock.patch.object(coach_tui, "relaunch", lambda label: labels.append(label) or 0):
+            self.assertEqual(coach_tui.install_requested("2.1.0"), 0)
+        self.assertEqual(labels, ["2.0.0 to 2.1.0"])
 
     def test_the_update_notice_lists_what_changed(self):
         folder = self.app_dir_with_changelog()

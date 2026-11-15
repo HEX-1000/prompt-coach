@@ -1,8 +1,10 @@
 """Self-update for Prompt Coach. Standard library only.
 
-On launch the TUI calls check_and_update(). It reads one small file, VERSION, from the
-official GitHub repository. If that version is newer than the local VERSION file, it
-installs the new code, then the TUI starts again from the updated files.
+On launch the TUI calls check(). It reads one small file, VERSION, from the main branch of
+the official GitHub repository. If that version is newer than the local VERSION file and the
+release tag v<version> exists with the same VERSION inside, the update is "available". The
+TUI says so, and F6 calls install(), which takes the code from that tag and restarts the app.
+With "auto_update": "install" the TUI installs on launch without asking.
 
 What an update touches
   - Code, docs, assets, requirements.txt, contexts/_template.md and rules/README.md are replaced.
@@ -10,16 +12,19 @@ What an update touches
   - Nothing is deleted. The files an update replaces are copied to .update_backup/ first.
 
 How it updates
-  - A git clone whose origin is the official repository: git pull --ff-only, and only when
-    no tracked file other than config.json has local edits.
-  - Any other copy (a downloaded ZIP): the repository ZIP is downloaded, every Python file is
+  - A git clone whose origin is the official repository: fetch the tag v<version>, then
+    git merge --ff-only, and only when no tracked file other than config.json has local edits.
+  - Any other copy (a downloaded ZIP): the ZIP of the tag is downloaded, every Python file is
     syntax-checked, and only then are files written.
+  - A version that is not tagged yet is not offered: status "current", "version X is not
+    tagged yet". The VERSION file inside the tag must equal the version asked for.
 
 After an update the app shows the entries of CHANGELOG.md between your old version and the
 new one (whats_new). CHANGELOG.md is shipped like any other file of the repository.
 
 Nothing about you is sent: the requests are plain GETs to raw.githubusercontent.com and
-github.com. Turn it off with "auto_update": false in config.json.
+github.com. "auto_update" in config.json: true checks and notifies, "install" also installs
+on launch, false does not check.
 
 Manual run:  python -B coach_update.py
 """
@@ -32,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -40,7 +46,9 @@ from pathlib import Path, PurePosixPath
 REPO = "HEX-1000/prompt-coach"
 BRANCH = "main"
 VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/VERSION"
-ZIP_URL = f"https://github.com/{REPO}/archive/refs/heads/{BRANCH}.zip"
+# {version} is replaced by the version number; the tag is v<version>.
+TAG_VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/v{{version}}/VERSION"
+ZIP_URL = f"https://github.com/{REPO}/archive/refs/tags/v{{version}}.zip"
 
 BACKUP_DIR = ".update_backup"
 MAX_ZIP_BYTES = 20 * 1024 * 1024
@@ -61,7 +69,7 @@ class UpdateError(Exception):
 
 @dataclass
 class UpdateResult:
-    # current | updated | offline | skipped | failed
+    # current | available | updated | offline | skipped | failed
     status: str
     old: str = ""
     new: str = ""
@@ -167,11 +175,13 @@ def _read_zip(data: bytes) -> dict[str, bytes]:
     return files
 
 
-def _check_files(files: dict[str, bytes], old: str) -> str:
+def _check_files(files: dict[str, bytes], old: str, expected: str) -> str:
     for name in REQUIRED_FILES:
         if name not in files:
             raise UpdateError(f"the download has no {name}")
     new = files["VERSION"].decode("utf-8", "replace").strip()
+    if new != expected:
+        raise UpdateError(f"the download is version {new}, not {expected}")
     if not is_newer(new, old):
         raise UpdateError(f"the download is version {new}, not newer than {old}")
     for rel, data in files.items():
@@ -197,13 +207,13 @@ def _target_for(app_dir: Path, rel: str) -> Path | None:
     return target
 
 
-def _update_zip(app_dir: Path, zip_url: str, old: str, timeout: float) -> UpdateResult:
+def _update_zip(app_dir: Path, zip_url: str, old: str, version: str, timeout: float) -> UpdateResult:
     try:
-        data = _fetch(zip_url, max(timeout, 30.0), MAX_ZIP_BYTES)
+        data = _fetch(zip_url.format(version=version), max(timeout, 30.0), MAX_ZIP_BYTES)
     except (OSError, ValueError) as exc:
         raise UpdateError(f"could not download the update: {exc}") from exc
     files = _read_zip(data)
-    new = _check_files(files, old)
+    new = _check_files(files, old, version)
 
     changes: list[tuple[str, Path]] = []
     for rel in sorted(files):
@@ -264,7 +274,7 @@ def _git(app_dir: Path, *args: str, timeout: float = 60) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr).rstrip()
 
 
-def _update_git(app_dir: Path, old: str, origin_match: str, branch: str) -> UpdateResult:
+def _update_git(app_dir: Path, old: str, version: str, origin_match: str, branch: str) -> UpdateResult:
     rc, origin = _git(app_dir, "remote", "get-url", "origin")
     if rc != 0 or origin_match.lower() not in origin.lower():
         return UpdateResult("skipped", old, "", "this clone does not point at the official repository")
@@ -278,29 +288,36 @@ def _update_git(app_dir: Path, old: str, origin_match: str, branch: str) -> Upda
 
     req_path = app_dir / "requirements.txt"
     req_before = req_path.read_bytes() if req_path.exists() else b""
-    rc, out = _git(app_dir, "pull", "--ff-only", "--quiet", "origin", branch, timeout=120)
+    tag = f"v{version}"
+    rc, out = _git(app_dir, "fetch", "--quiet", "origin", f"refs/tags/{tag}:refs/tags/{tag}", timeout=120)
     if rc != 0:
         last = out.splitlines()[-1:] or ["no output"]
-        raise UpdateError(f"git pull failed: {last[0]}")
+        raise UpdateError(f"git could not fetch the tag {tag}: {last[0]}")
+    rc, out = _git(app_dir, "merge", "--ff-only", "--quiet", tag, timeout=120)
+    if rc != 0:
+        last = out.splitlines()[-1:] or ["no output"]
+        raise UpdateError(f"git merge failed: {last[0]}")
     new = read_local_version(app_dir)
+    if new != version:
+        raise UpdateError(f"the tag {tag} holds version {new}, not {version}")
     if req_path.exists() and not _same(req_before, req_path.read_bytes()):
         _pip_install(req_path)
-    return UpdateResult("updated" if is_newer(new, old) else "current", old, new, "git pull")
+    return UpdateResult("updated" if is_newer(new, old) else "current", old, new, f"git tag {tag}")
 
 
 # --------------------------------------------------------------------------- entry point
 
 
-def check_and_update(
+def check(
     app_dir: Path,
     *,
     version_url: str = VERSION_URL,
-    zip_url: str = ZIP_URL,
-    origin_match: str = REPO,
-    branch: str = BRANCH,
+    tag_version_url: str = TAG_VERSION_URL,
     timeout: float = 4.0,
 ) -> UpdateResult:
-    """Compare VERSION with GitHub and install a newer copy. Never raises."""
+    """Compare VERSION on main with the local one. Never raises, installs nothing.
+
+    "available" means a newer version exists and its tag holds the same VERSION."""
     app_dir = Path(app_dir).resolve()
     old = read_local_version(app_dir)
     try:
@@ -312,15 +329,59 @@ def check_and_update(
     if not is_newer(remote, old):
         return UpdateResult("current", old, remote)
     try:
+        tagged = _fetch(tag_version_url.format(version=remote), timeout, 64).decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return UpdateResult("current", old, remote, f"version {remote} is not tagged yet")
+        return UpdateResult("offline", old)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, FileNotFoundError):
+            return UpdateResult("current", old, remote, f"version {remote} is not tagged yet")
+        return UpdateResult("offline", old)
+    except (OSError, ValueError):
+        return UpdateResult("offline", old)
+    if tagged != remote:
+        return UpdateResult("failed", old, remote, f"the tag v{remote} holds version {tagged[:20]}, not {remote}")
+    return UpdateResult("available", old, remote)
+
+
+def install(
+    app_dir: Path,
+    version: str,
+    *,
+    zip_url: str = ZIP_URL,
+    origin_match: str = REPO,
+    branch: str = BRANCH,
+    timeout: float = 4.0,
+) -> UpdateResult:
+    """Install the release tag v<version>. Never raises."""
+    app_dir = Path(app_dir).resolve()
+    old = read_local_version(app_dir)
+    try:
         if (app_dir / ".git").exists() and shutil.which("git"):
-            result = _update_git(app_dir, old, origin_match, branch)
-        else:
-            result = _update_zip(app_dir, zip_url, old, timeout)
+            return _update_git(app_dir, old, version, origin_match, branch)
+        return _update_zip(app_dir, zip_url, old, version, timeout)
     except UpdateError as exc:
-        return UpdateResult("failed", old, remote, str(exc))
+        return UpdateResult("failed", old, version, str(exc))
     except Exception as exc:  # an update problem must never stop the app from starting
-        return UpdateResult("failed", old, remote, f"{type(exc).__name__}: {exc}")
-    return result
+        return UpdateResult("failed", old, version, f"{type(exc).__name__}: {exc}")
+
+
+def check_and_update(
+    app_dir: Path,
+    *,
+    version_url: str = VERSION_URL,
+    tag_version_url: str = TAG_VERSION_URL,
+    zip_url: str = ZIP_URL,
+    origin_match: str = REPO,
+    branch: str = BRANCH,
+    timeout: float = 4.0,
+) -> UpdateResult:
+    """check(), then install() when a version is available. Never raises."""
+    found = check(app_dir, version_url=version_url, tag_version_url=tag_version_url, timeout=timeout)
+    if found.status != "available":
+        return found
+    return install(app_dir, found.new, zip_url=zip_url, origin_match=origin_match, branch=branch, timeout=timeout)
 
 
 # --------------------------------------------------------------------------- what's new

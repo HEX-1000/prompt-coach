@@ -75,6 +75,7 @@ HELP_TEXT = """\
   ctrl+n        new prompt
   f3            switch local model
   f4            output language: same, English, Turkish
+  f6            install the available update and restart (your text is kept)
   tab           move focus (projects, text, fields)
   f1            this sheet ("?" also works when you are not typing in a box)
   ctrl+q        quit
@@ -221,6 +222,7 @@ class CoachApp(App):
         Binding("f2", "paste_clipboard", "paste clipboard"),
         Binding("f3", "cycle_model", "model", priority=True),
         Binding("f4", "cycle_lang", "language", priority=True),
+        Binding("f6", "install_update", "update", priority=True),
         Binding("question_mark,f1", "help", "keys"),
         Binding("y,ctrl+y", "copy", "copy"),
         Binding("g", "save_terms", "save terms"),
@@ -250,6 +252,8 @@ class CoachApp(App):
         self.texts: dict[str, str] = {}      # "original" and "translation", as last shown or edited
         self.result_view = "original"
         self.translate_error = ""
+        self.update_version = ""             # set when the launch check finds a tagged newer version
+        self.install_version = ""            # set by F6: main() installs it after the app has closed
 
     # ------------------------------------------------------------------ layout
 
@@ -302,6 +306,34 @@ class CoachApp(App):
         self.run_worker(self._check_ollama, thread=True, group="ping")
         for text, severity in STARTUP_NOTES:
             self.notify(text, severity=severity, timeout=20 if "\n" in text else 8)
+        self._restore_draft()
+        if self.cfg.get("auto_update", True) is True:  # "install" ran before the UI; false never checks
+            self.run_worker(self._check_update, thread=True, group="update")
+
+    def _restore_draft(self) -> None:
+        """Put back the text F6 stored before it restarted the app, then forget it."""
+        draft = self.state.pop("draft", None)
+        if draft is None:
+            return
+        save_state(self.state)
+        if isinstance(draft, str) and draft:
+            self.query_one("#prompt", TextArea).load_text(draft)
+
+    def _check_update(self) -> None:
+        """Worker thread: look for a tagged newer version. Offline and errors stay silent."""
+        try:
+            import coach_update
+
+            result = coach_update.check(core.APP_DIR)
+        except Exception:
+            return
+        if result.status == "available":
+            self.call_from_thread(self._update_available, result.new)
+
+    def _update_available(self, version: str) -> None:
+        self.update_version = version
+        self.notify(f"Version {version} is available. F6 installs it and restarts.", timeout=20)
+        self.refresh_chrome()
 
     # ------------------------------------------------------------------ chrome
 
@@ -320,6 +352,9 @@ class CoachApp(App):
         settings.append(self.model + "\n", style=TEXT)
         settings.append("output   ", style=MUTED)
         settings.append(self.out_lang, style=TEXT)
+        if self.update_version:
+            settings.append("\nupdate   ", style=MUTED)
+            settings.append(f"{self.update_version} (f6)", style=PEACH)
         self.query_one("#settings", Static).update(settings)
 
         steps = Text()
@@ -410,6 +445,19 @@ class CoachApp(App):
         self.state["model"] = self.model
         save_state(self.state)
         self.refresh_chrome()
+
+    def action_install_update(self) -> None:
+        """F6: store the text of the box, close the app; main() installs the update and starts again."""
+        if not self.update_version:
+            self.notify("No update is available.", timeout=4)
+            return
+        if self.busy_since is not None:
+            self.notify("Wait for the running step to finish, then press f6.", severity="warning", timeout=5)
+            return
+        self.state["draft"] = self.query_one("#prompt", TextArea).text
+        save_state(self.state)
+        self.install_version = self.update_version
+        self.exit()
 
     def action_cycle_lang(self) -> None:
         langs = core.OUTPUT_LANGUAGES
@@ -817,17 +865,24 @@ def update_notice(label: str, app_dir=None) -> str:
     return text
 
 
-def auto_update() -> int | None:
-    """Look for a newer version before the UI starts (see coach_update.py).
+def relaunch(label: str) -> int:
+    """Start the updated copy in this process's place. It shows what is new (see update_notice)."""
+    env = dict(os.environ, PROMPT_COACH_UPDATED=label)
+    return subprocess.call([sys.executable, "-B", str(core.APP_DIR / "coach_tui.py")], env=env)
 
-    Returns an exit code when an update was installed and the new copy already ran in this
-    process's place. Returns None to carry on starting this copy. Never raises."""
+
+def auto_update() -> int | None:
+    """The update step before the UI starts (see coach_update.py).
+
+    "auto_update": "install" installs a newer tagged version here, without asking. true only checks, in
+    the UI, after it is up. false does nothing. Returns an exit code when an update was installed and the
+    new copy already ran in this process's place. Returns None to carry on starting this copy. Never raises."""
     done = os.environ.get("PROMPT_COACH_UPDATED")
     if done:  # this is the relaunch after an update
         STARTUP_NOTES.append((update_notice(done), "information"))
         return None
     try:
-        if not core.load_config().get("auto_update", True):
+        if core.load_config().get("auto_update", True) != "install":
             return None
         import coach_update
 
@@ -837,10 +892,26 @@ def auto_update() -> int | None:
     if result.status == "updated":
         label = f"{result.old} to {result.new}"
         print(f"Prompt Coach: updated {label}. Starting the new version...", flush=True)
-        env = dict(os.environ, PROMPT_COACH_UPDATED=label)
-        return subprocess.call([sys.executable, "-B", str(core.APP_DIR / "coach_tui.py")], env=env)
+        return relaunch(label)
     if result.status in ("failed", "skipped") and result.message:
         STARTUP_NOTES.append((f"Update check: {result.message}. Still on {result.old}.", "warning"))
+    return None
+
+
+def install_requested(version: str) -> int | None:
+    """After F6 closed the app: install the version. Returns an exit code when the new copy ran,
+    or None when the old version should start again (the failure is queued as a notice)."""
+    try:
+        import coach_update
+
+        print(f"Prompt Coach: installing {version}...", flush=True)
+        result = coach_update.install(core.APP_DIR, version)
+    except Exception as exc:
+        STARTUP_NOTES.append((f"Update check: {type(exc).__name__}: {exc}. Still on the old version.", "warning"))
+        return None
+    if result.status == "updated":
+        return relaunch(f"{result.old} to {result.new}")
+    STARTUP_NOTES.append((f"Update check: {result.message or result.status}. Still on {result.old}.", "warning"))
     return None
 
 
@@ -849,7 +920,15 @@ def main() -> None:
     code = auto_update()
     if code is not None:
         sys.exit(code)
-    CoachApp().run()
+    while True:
+        app = CoachApp()
+        app.run()
+        if not app.install_version:
+            return
+        STARTUP_NOTES.clear()
+        code = install_requested(app.install_version)
+        if code is not None:
+            sys.exit(code)  # the new copy has run and closed
 
 
 if __name__ == "__main__":

@@ -52,7 +52,8 @@ DEFAULT_CONFIG = {
     "max_questions": 3,
     # A file name under targets/ (without .json), or an object of the same shape.
     "target": "claude",
-    # Check GitHub for a newer version on launch and update in place. See coach_update.py.
+    # true: look for a newer tagged version after launch and say so (F6 installs it).
+    # "install": install it on launch without asking. false: never check. See coach_update.py.
     "auto_update": True,
 }
 

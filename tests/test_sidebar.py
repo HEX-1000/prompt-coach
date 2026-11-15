@@ -20,6 +20,12 @@ except ImportError:  # textual is not installed
 @unittest.skipIf(coach_tui is None, "textual is not installed")
 class SidebarTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        import coach_update  # the launch check must never reach the network in a test
+        from unittest import mock as _mock
+
+        _p = _mock.patch.object(coach_update, "check", lambda *a, **k: coach_update.UpdateResult("offline"))
+        _p.start()
+        self.addCleanup(_p.stop)
         self.tmp = Path(tempfile.mkdtemp())
         self.contexts = self.tmp / "contexts"
         self.contexts.mkdir()
