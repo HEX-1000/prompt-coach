@@ -107,7 +107,7 @@ The brief is the text of the project file without its title line, its glossary a
 | `coach_update.py` | the launch-time update check, see [Updates](#updates) |
 | `VERSION` | the installed version, compared with the one on GitHub |
 | `CHANGELOG.md` | what changed in each version, newest first |
-| `tests/` | `python -B -m unittest discover -s tests`; GitHub runs them on Windows and Linux with Python 3.10 and 3.12 |
+| `tests/` | `python -B -m unittest discover -s tests`; GitHub runs them on Windows and Linux with Python 3.10, 3.12 and 3.14 |
 | `prompt_coach.py` | plain terminal version, standard library only: `python -B prompt_coach.py --project my-project "your prompt"`; `--no-brief` leaves the project brief out |
 | `contexts/*.md` | one file per project, with its brief and its glossary; files starting with `_` are not listed |
 | `rules/` | no longer used, see [rules/README.md](rules/README.md) |
