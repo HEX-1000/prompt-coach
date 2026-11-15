@@ -1,0 +1,8 @@
+{
+  "name": "Claude",
+  "depths": {
+    "light": {"model": "Haiku", "effort": "low"},
+    "standard": {"model": "Sonnet", "effort": "medium"},
+    "deep": {"model": "Opus", "effort": "high"}
+  }
+}

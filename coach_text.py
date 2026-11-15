@@ -260,6 +260,12 @@ def _state(q) -> str:
     return "left" if a == "!" else "answered"
 
 
+def attached_terms(text: str, note: str, questions, entries: list[GlossaryEntry]) -> list[GlossaryEntry]:
+    """The glossary entries that occur in the text, the note and the answers together."""
+    searched = " ".join([text, note] + [q.answer for q in questions if _state(q) == "answered"])
+    return terms_in(searched, entries)
+
+
 def assemble(text: str, questions, note: str, entries: list[GlossaryEntry], lang: str) -> list[tuple[str, str]]:
     """Segments (kind, text), kind 'user' or 'fixed'. The segment layout does not depend on lang.
 
@@ -288,8 +294,7 @@ def assemble(text: str, questions, note: str, entries: list[GlossaryEntry], lang
         for q in left:
             segs += [("fixed", "\n- "), ("user", one_line(q.question))]
 
-    searched = " ".join([text, note] + [q.answer for q in questions if _state(q) == "answered"])
-    found = terms_in(searched, entries)
+    found = attached_terms(text, note, questions, entries)
     if checks or found:
         segs.append(("fixed", f"\n\n{lab['terms']}"))
         for q in checks:

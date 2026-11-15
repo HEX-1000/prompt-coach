@@ -6,9 +6,10 @@ Usage:
     python -B prompt_coach.py                  (reads the clipboard)
     python -B prompt_coach.py --list           (lists project context files)
 
-Stage 1 restates what you mean and asks questions. Answer each one (Enter skips),
-then confirm with Enter or type a correction. Stage 2 prints the final prompt and
-the model/effort recommendation and copies the prompt to the clipboard.
+One model call restates what you mean and asks a few questions. Answer each one (Enter
+skips, ! leaves it to the assistant), add an optional note, and the final prompt is built
+in code: your text unchanged, then the note, the answers and the project terms. It is
+printed and copied to the clipboard.
 Standard library only. Requires Ollama on localhost:11434.
 """
 import argparse
@@ -29,12 +30,25 @@ def pick_context(cfg, key):
 
 
 def show_round(rnd):
-    print("\nUnderstanding:")
+    print("\nWhat you mean:")
     print("  " + rnd.understanding.replace("\n", "\n  "))
-    print("\nRepaired text:")
-    print("  " + rnd.repaired_text.replace("\n", "\n  "))
     if rnd.stats:
         print(f"\n[{rnd.stats.line()}]")
+
+
+def depth_line(session, res):
+    effort = f", effort {res.effort}" if res.effort else ""
+    return f"depth {res.depth}: {res.model}{effort} ({session.target['name']})"
+
+
+def translation_line(tr):
+    ok = tr.parts - len(tr.kept)
+    line = f"translated to {tr.language}: {ok} of {tr.parts} parts passed the checks."
+    for k in tr.kept:
+        line += f"\n  part {k['index']} kept in the original language: {', '.join(k['problems'])}"
+    if not tr.kept:
+        line += " A wrong idiom can still slip through; read it before you send it."
+    return line
 
 
 def main():
@@ -65,48 +79,55 @@ def main():
         print("No prompt given (argument, --file, or clipboard).")
         return 1
 
-    session = core.CoachSession(cfg, text, pick_context(cfg, args.project), args.model, args.lang)
-    for w in session.warnings:
-        print(f"warning: {w}")
-
     try:
+        session = core.CoachSession(cfg, text, pick_context(cfg, args.project), args.model, args.lang)
+        for w in session.warnings:
+            print(f"warning: {w}")
         rnd = session.understand()
-        while True:
-            show_round(rnd)
-            if rnd.questions:
-                print("\nQuestions (Enter skips):")
-                for i, q in enumerate(rnd.questions, 1):
-                    print(f"\n {i}. {q.question}")
-                    if q.why:
-                        print(f"    why: {q.why}")
-                    q.answer = input("    > ").strip()
-                if any(q.answer for q in rnd.questions):
-                    rnd = session.understand()
-                    continue
-            fix = input("\nEnter = understanding is right. Or type a correction: ").strip()
-            if not fix:
-                break
-            session.set_correction(fix)
-            rnd = session.understand()
-
-        res = session.compose()
+        show_round(rnd)
+        if rnd.questions:
+            print("\nQuestions (Enter skips, ! leaves it to the assistant):")
+            for i, q in enumerate(rnd.questions, 1):
+                tag = "  [term check]" if q.source == "term-check" else ""
+                print(f"\n {i}. {q.question}{tag}")
+                q.answer = input("    > ").strip()
+        if rnd.more_terms:
+            print("\nAlso not in the glossary: " + ", ".join(rnd.more_terms))
+        session.set_note(input("\nNote to add (Enter for none): "))
+        res = session.build()
     except core.CoachError as exc:
         print(f"error: {exc}")
         return 1
 
-    print(f"\nModel: {res.model}   Effort: {res.effort}")
-    print(f"Why: {res.reason}")
+    print("\n" + depth_line(session, res))
+    if res.terms:
+        print(f"{len(res.terms)} project term(s) attached: " + ", ".join(res.terms))
     for n in res.notes:
         print(f"note: {n}")
-    if res.missing_context:
-        print("Still missing:")
-        for item in res.missing_context:
-            print(f"  - {item}")
-    copied = core.copy_to_clipboard(res.final_prompt)
+    final = res.final_prompt
+    if session.needs_translation():
+        print(f"\nTranslating to {session.out_lang}...")
+        try:
+            tr = session.translate()
+        except core.CoachError as exc:
+            print(f"error: {exc}\nShowing the original prompt instead.")
+        else:
+            final = tr.text
+            print(translation_line(tr))
+    copied = core.copy_to_clipboard(final)
+    if copied:
+        session.mark_copied(final)
     print("\nFinal prompt" + (" (copied to clipboard)" if copied else "") + ":\n")
-    print(res.final_prompt)
-    if res.stats:
-        print(f"\n[{res.stats.line()}]")
+    print(final)
+
+    new = session.new_terms()
+    if new and session.context:
+        reply = input(f"\nSave {len(new)} new term(s) to the glossary of {session.context.name}? [y/N] ")
+        if reply.strip().lower() in ("y", "yes"):
+            try:
+                print("saved: " + ", ".join(session.save_terms()))
+            except core.CoachError as exc:
+                print(f"error: {exc}")
     session.save()
     return 0
 

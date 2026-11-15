@@ -1,16 +1,12 @@
 """Core logic for the local prompt coach.
 
-Two stages, both run on a local Ollama model:
-  Stage 1 (understand): restate what the user means, repair the text, ask the
-  questions that are needed. Repeats with the user's answers until the user
-  confirms the understanding.
-  Stage 2 (compose): write the final prompt and recommend a Claude model and effort.
+One model call, then code builds the prompt (see docs/DESIGN-core.md):
+  understand: restate what the user means, ask up to a few questions, label the depth.
+  build: the user's text unchanged, then the note, the answers, the questions left to
+  the assistant and the glossary lines of the terms that occur. No model call.
 
-Context sources:
-  - a per-project context file (contexts/*.md) with a glossary and optional
-    include paths (for example a project's CLAUDE.md or STATE.md),
-  - the user's writing rules (rules/communication_rules.md), used only for the
-    coach's own behaviour and style, never copied into the final prompt.
+Context sources: a per-project context file (contexts/*.md) with a glossary and optional
+include paths (for example a project's CLAUDE.md or STATE.md).
 
 Standard library only. The coach itself talks only to Ollama on localhost. The one other network
 use is the launch-time update check in coach_update.py, which can be turned off.
@@ -30,29 +26,45 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+from coach_text import (  # noqa: F401  (CODE_RE, COMMON_CODES, unknown_codes stay importable from here)
+    CODE_RE, COMMON_CODES, GlossaryEntry, add_glossary_line, assemble, attached_terms,
+    check_part, guess_language, one_line, parse_glossary, render, split_parts, unknown_codes,
+)
+
 APP_DIR = Path(__file__).resolve().parent
 
 DEFAULT_CONFIG = {
     "ollama_url": "http://localhost:11434",
     # First entry is the default. F3 in the TUI (or --model in the CLI) switches.
     "models": ["qwen3.5:9b", "qwen3.5:4b"],
-    "num_ctx": 16384,
+    "num_ctx": 8192,
     "think": False,
     "temperature_understand": 0.3,
-    "temperature_compose": 0.2,
     "timeout_s": 600,
-    "rules_file": "rules/communication_rules.md",
     "contexts_dir": "contexts",
     "history_dir": "history",
     "include_max_chars": 12000,
-    "max_questions": 5,
+    "max_questions": 3,
+    # A file name under targets/ (without .json), or an object of the same shape.
+    "target": "claude",
     # Check GitHub for a newer version on launch and update in place. See coach_update.py.
     "auto_update": True,
 }
 
+# The 1.x config.json pins these two values. Without "config_version" they count as not set.
+LEGACY_CONFIG_VALUES = {"num_ctx": 16384, "max_questions": 5}
+
 OUTPUT_LANGUAGES = ["same", "English", "Turkish"]
-MODELS = ["haiku", "sonnet", "opusplan", "opus"]
-EFFORTS = ["low", "medium", "high", "max"]
+
+# Context budget: characters per token is below the lowest value measured (3.2).
+CHARS_PER_TOKEN = 3.0
+OUTPUT_RESERVE = 1000  # tokens kept free for the model's answer
+MAX_TERM_CHECKS = 5
+
+# Translation (section 9 of docs/DESIGN-core.md)
+LANG_CODES = {"English": "en", "Turkish": "tr"}
+PART_LIMIT = 350        # characters per part
+BATCH_LIMIT = 4000      # source characters per model call
 
 
 class CoachError(Exception):
@@ -67,8 +79,50 @@ def load_config(path: Path | None = None) -> dict:
     path = path or APP_DIR / "config.json"
     if path.exists():
         with open(path, encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            if "config_version" not in raw:
+                for key, old in LEGACY_CONFIG_VALUES.items():
+                    if raw.get(key) == old:
+                        del raw[key]
+            cfg.update(raw)
     return cfg
+
+
+BUILTIN_TARGET = {
+    "name": "the assistant",
+    "depths": {
+        "light": {"model": "a small, fast model"},
+        "standard": {"model": "a mid-size model"},
+        "deep": {"model": "the strongest model you have"},
+    },
+}
+DEPTHS = ("light", "standard", "deep")
+
+
+def _valid_target(obj) -> bool:
+    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str) or not obj["name"].strip():
+        return False
+    depths = obj.get("depths")
+    if not isinstance(depths, dict):
+        return False
+    return all(isinstance(depths.get(d), dict) and isinstance(depths[d].get("model"), str)
+               and depths[d]["model"].strip() and isinstance(depths[d].get("effort", ""), str)
+               for d in DEPTHS)
+
+
+def load_target(cfg: dict) -> dict:
+    """The target named in cfg["target"]; the built-in one when it is missing or broken."""
+    spec = cfg.get("target", "claude")
+    if isinstance(spec, str):
+        name = spec.strip()
+        if not name or any(c in name for c in "/\\:") or name.startswith("."):
+            return BUILTIN_TARGET
+        try:
+            spec = json.loads((APP_DIR / "targets" / (name + ".json")).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return BUILTIN_TARGET
+    return spec if _valid_target(spec) else BUILTIN_TARGET
 
 
 def resolve(path_str: str, base: Path = APP_DIR) -> Path:
@@ -105,6 +159,34 @@ class ProjectContext:
                 text = text[:max_chars]
             parts.append(f"--- included file: {inc.name} ---\n{text.strip()}")
         return "\n\n".join(p for p in parts if p), warnings
+
+    def add_terms(self, pairs: list[tuple[str, str]]) -> list[str]:
+        """Add `- TERM: definition` lines to the glossary of this file. Returns the terms written."""
+        try:
+            raw = self.path.read_bytes()
+            bom = raw.startswith(b"\xef\xbb\xbf")
+            text = raw.decode("utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CoachError(f"Cannot read {self.path}: {exc}") from exc
+        written = []
+        for term, definition in pairs:
+            new = add_glossary_line(text, term, definition)
+            if new != text:
+                text = new
+                written.append(term)
+        if not written:
+            return []
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            tmp.write_bytes((b"\xef\xbb\xbf" if bom else b"") + text.encode("utf-8"))
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise CoachError(f"Cannot write {self.path}: {exc}") from exc
+        return written
 
 
 def parse_context_file(path: Path) -> ProjectContext:
@@ -156,40 +238,6 @@ def list_contexts(cfg: dict) -> list[ProjectContext]:
             out.append(parse_context_file(p))
         except (OSError, UnicodeDecodeError):
             continue
-    return out
-
-
-def load_rules(cfg: dict) -> str:
-    path = resolve(cfg["rules_file"])
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8", errors="replace").strip()
-
-
-# --------------------------------------------------------------------------- unknown-term check
-
-# Codes such as D5, A02, E1, V0.25.1, UE5. Small models expand these from general
-# knowledge ("D5" -> Nikon D5000); this check makes sure they are asked about instead.
-CODE_RE = re.compile(r"(?<![\w.])([A-Z]{1,3}\d{1,3}(?:\.\d+)*)(?![\w])")
-COMMON_CODES = {
-    "H264", "H265", "MP3", "MP4", "UTF8", "UTF16", "X64", "X86", "IPV4", "IPV6", "SHA1",
-    "SHA256", "MD5", "S3", "EC2", "PS4", "PS5", "USB2", "USB3", "GPT4", "GPT5", "WIN10",
-    "WIN11", "DDR4", "DDR5", "M1", "M2", "M3", "M4", "A4", "A3", "K8S", "4K", "8K", "B2B",
-    "P2P", "L1", "L2", "L3", "HTTP2", "HTTP3", "TLS1", "C99", "C11", "C17", "C23", "ES6",
-    "Q1", "Q2", "Q3", "Q4", "H1", "H2", "H3", "H4", "H5", "H6", "MP2", "AV1", "VP9", "IE11",
-}
-
-
-def unknown_codes(text: str, known_text: str) -> list[str]:
-    known = known_text.lower()
-    seen, out = set(), []
-    for m in CODE_RE.finditer(text):
-        code = m.group(1)
-        if code in seen or code.upper() in COMMON_CODES:
-            continue
-        seen.add(code)
-        if code.lower() not in known:
-            out.append(code)
     return out
 
 
@@ -289,91 +337,59 @@ UNDERSTAND_SCHEMA = {
     "type": "object",
     "properties": {
         "understanding": {"type": "string"},
-        "repaired_text": {"type": "string"},
         "questions": {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"question": {"type": "string"}, "why": {"type": "string"}},
-                "required": ["question", "why"],
+                "properties": {
+                    "missing": {"type": "string"},
+                    "question": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["fact", "choice"]},
+                },
+                "required": ["missing", "question", "kind"],
             },
         },
+        "depth": {"type": "string", "enum": list(DEPTHS)},
     },
-    "required": ["understanding", "repaired_text", "questions"],
+    "required": ["understanding", "questions", "depth"],
 }
 
-COMPOSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "final_prompt": {"type": "string"},
-        "missing_context": {"type": "array", "items": {"type": "string"}},
-        "model": {"type": "string", "enum": MODELS},
-        "effort": {"type": "string", "enum": EFFORTS},
-        "reason": {"type": "string"},
-    },
-    "required": ["final_prompt", "missing_context", "model", "effort", "reason"],
-}
+UNDERSTAND_SYSTEM = """You check a text that a user is about to send to {target}, an AI assistant. You do not answer the text and you do not rewrite it. You tell the user how the text reads, and you ask for facts that are missing. Return JSON only.
 
-UNDERSTAND_SYSTEM = """You are a prompt coach. The user wrote a text they plan to send to Claude, an AI assistant. In this stage you make sure you understand the text before anything is rewritten. Return JSON only.
+understanding: Restate in two to five plain sentences what the user wants {target} to do, what {target} will work from, and what result the user expects. Write to the user in the second person ("You want {target} to ..."); never call them "the user". {target} does the work, so never write "I", "me" or "we".{address_note} State only what the text and the project context say. Do not mention your questions here.
 
-understanding: Restate in plain words what the user wants Claude to do, what Claude will work from, and what result the user expects. Address the user as "you". Two to six sentences. State only what the text, the project context or the user's answers say. If a point is unclear, leave it out of the restatement and ask about it instead.
+questions: Facts that {target} needs and that only the user knows. Good questions ask what a name, code or term means, which file, version, device, number, date or audience is meant, or what already exists. At most {max_q} questions, most useful first. An empty list is a good answer when the text is clear.
+For each question write "missing" first: at most 15 words that name the fact that is missing. Then write the question.
+Rules for questions:
+- Never ask the user to make a choice that the text asks {target} to make. Never ask for a preference, an opinion or a decision the user has not made. Example: the text says "tell me which license to use". Do not ask "Which license do you want?", because choosing the license is {target}'s job.
+- Do not ask about anything the text or the project context already says.
+- Do not doubt what the user states about their own devices, files, versions, dates or work. The user knows these better than you do.
+- Do not ask about a term, code or name that the project context defines. If one is not defined, ask what it is; never expand it from general knowledge.
+- "kind" is "fact" when the user already knows the answer, and "choice" when the question asks the user to pick, prefer or decide something.
 
-repaired_text: The user's text with spelling, grammar and punctuation fixed. Keep the user's language, wording, tone and order of ideas. Do not add, remove or reorder requests. If the text is already correct, return it unchanged.
+depth: how much reasoning the task needs from {target}.
+- "light": a lookup, a format change, a short rewrite, one simple fact.
+- "standard": routine work with a clear path: writing, editing, summarising, research with a clear goal, routine code, carrying out an agreed plan.
+- "deep": a decision with trade-offs, a design, a diagnosis, a review of evidence, strategy, or advice the user will act on.
 
-questions: The questions Claude would need answered to do the task well. Ask instead of guessing. Ask when:
-- a term, code, name or abbreviation is not defined in the project context. Never expand it from general knowledge. Example: if "D5" is not in the project context, ask what D5 is; do not assume it is a camera or a product.
-- the goal, the input, the scope, a constraint or the expected output is unclear and the answer would change the result.
-Do not ask about anything the text, the project context or earlier answers already settle. Do not ask about preferences that have an obvious default. At most {max_q} questions, most important first. Each question has a short "why": what would go wrong without the answer. Return an empty list when nothing important is unclear.
+Write "understanding", every "missing" and every question in {lang}. Write plainly, in short sentences. Do not use the em dash character."""
 
-Write "understanding" and the questions in the same language as the user's text ({lang_hint}). Keep the repaired text in the user's language."""
+TURKISH_ADDRESS_NOTE = (' In Turkish use the "sen" verb forms (istiyorsun, bekliyorsun) '
+                        'and never write "kullanıcı".')
 
-COMPOSE_SYSTEM = """You are a prompt coach. The user confirmed what their text means. Now write the final prompt they will send to Claude, and recommend a Claude model and effort level. Return JSON only.
-
-final_prompt:
-- Build it from the user's repaired text and the facts in their answers. Keep the user's voice: their wording, tone, formality and order of ideas. Change wording only where it was unclear or wrong.
-- Put each clarified fact where it belongs in the text. When the answers or the project context define a project term, explain it briefly the first time it appears, for example "D5 (the chunking experiment)".
-- Do not add requests, steps, constraints or output formats that the user did not ask for or confirm.
-- Do not include the writing rules, a role line such as "You are an expert", a greeting you invented, or a sign-off. The user's Claude projects already contain the writing rules.
-- Use headings or lists only when the user's text already had that structure or the user listed steps.
-- Language of the final prompt: {out_lang}.
-
-missing_context: facts Claude will still need that nobody has supplied. Empty list if none. Never list something the user already answered.
-
-model: the cheapest Claude model that can do the task well.
-- "haiku": lookups, formatting, short rewrites, simple factual questions.
-- "sonnet": routine coding, editing, summaries, most writing, step-by-step execution of an agreed plan.
-- "opusplan": a coding task that needs a design decision first, then implementation (Claude Code only).
-- "opus": architecture, experiment design, decisions with trade-offs, hard debugging, reviewing evidence.
-
-effort:
-- "low" only for mechanical work: fixing typos, reformatting, looking up one fact.
-- "medium" for routine work with a clear plan.
-- "high" when the task needs judgment: comparing options, designing, diagnosing a problem, reviewing evidence, interpreting results, or writing whose quality depends on reasoning.
-- "max" only for rare, high-stakes reviews.
-When torn between two levels, choose the higher one.
-
-reason: one or two plain sentences on why this model and effort."""
+EM_DASH = chr(0x2014)
+_EM_DASH_RE = re.compile(r"\s*" + EM_DASH + r"\s*")
 
 
-def _lang_instruction(out_lang: str) -> str:
-    if out_lang == "same":
-        return "the same language as the user's text"
-    return f"{out_lang}. If the user wrote in another language, translate faithfully and keep their tone"
+def _no_em_dash(text: str) -> str:
+    return _EM_DASH_RE.sub(", ", text)
 
 
-def _shared_sections(rules: str, context: ProjectContext | None, context_text: str) -> str:
-    parts = []
-    if rules:
-        parts.append(
-            "WRITING RULES. Follow them in everything you write (restatement, questions, final "
-            "prompt). Never copy or summarise them into your output.\n<rules>\n" + rules + "\n</rules>"
-        )
+def _shared_sections(context: ProjectContext | None, context_text: str) -> str:
     if context:
-        parts.append(f"PROJECT CONTEXT: {context.name}\n<context>\n{context_text}\n</context>")
-    else:
-        parts.append("PROJECT CONTEXT: none selected. Treat every project-specific term, code "
-                     "or name as unknown and ask about it.")
-    return "\n\n".join(parts)
+        return f"PROJECT CONTEXT: {context.name}\n<context>\n{context_text}\n</context>"
+    return ("PROJECT CONTEXT: none selected. Treat every project-specific term, code "
+            "or name as unknown and ask about it.")
 
 
 # --------------------------------------------------------------------------- session
@@ -382,39 +398,70 @@ def _shared_sections(rules: str, context: ProjectContext | None, context_text: s
 @dataclass
 class Question:
     question: str
-    why: str = ""
+    missing: str = ""
     answer: str = ""
     source: str = "model"  # "model" or "term-check"
+    term: str = ""         # the code, for a term check
 
 
 @dataclass
 class Round:
     understanding: str
-    repaired_text: str
     questions: list[Question]
-    correction: str = ""
+    note: str = ""
+    depth: str = "standard"
     stats: CallStats | None = None
+    more_terms: list[str] = field(default_factory=list)  # unknown codes that were not asked
 
 
 @dataclass
 class Result:
     final_prompt: str
-    missing_context: list[str]
+    depth: str
     model: str
     effort: str
-    reason: str
+    terms: list[str]   # keys of the glossary lines attached to the prompt
     notes: list[str]
-    stats: CallStats | None = None
+
+
+@dataclass
+class Translation:
+    language: str                  # "English" or "Turkish"
+    text: str                      # the whole final prompt in that language
+    parts: int                     # parts that were sent to the model
+    kept: list[dict] = field(default_factory=list)   # [{"index": n, "problems": [...]}]
+    stats: list[CallStats] = field(default_factory=list)
+
+
+TRANSLATE_SYSTEM = """You translate a text into {language}. The text is a request that a user wrote for an AI assistant. The user message is a JSON object: each key is a part number and each value is one part of the text. Return a JSON object with the same keys. Each value is the translation of that part and nothing else.
+
+Rules:
+- Translate every sentence, every clause and every list item of a part. If the part lists three things, the translation lists three things. Do not shorten, summarise, explain or answer.
+- Keep each part separate. Never move words from one part into another.
+- Keep the user's tone and the order of the ideas. An informal sentence stays informal.
+- Copy unchanged: URLs, file names, paths, code, commands, numbers, version numbers, quotation marks, and the names of people, products and projects.
+- Words that are already in {language} stay as they are. A part that is already in {language} is returned unchanged."""
+
+
+def _app_version() -> str:
+    try:
+        return (APP_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 class CoachSession:
-    """Holds one run of the two-stage flow. UI code calls the methods in order:
+    """Holds one run. UI code calls the methods in order:
 
         s = CoachSession(cfg, text, context, model, out_lang)
-        rnd = s.understand()            # stage 1, first round
-        ... fill rnd.questions[i].answer and/or s.set_correction("...")
-        rnd = s.understand()            # next round with the answers
-        res = s.compose()               # stage 2, after the user confirms
+        rnd = s.understand()          # the one model call
+        ... fill rnd.questions[i].answer, then s.set_note("...")
+        res = s.build()               # no model call
+        if s.needs_translation(): s.translate(progress)   # model calls, section 9
+        s.new_terms()                 # [(code, answer)] not yet in the glossary
+        s.save_terms()                # writes them, returns the codes written
+        s.mark_copied(text)           # remembers what was copied; call save() after it
+        s.save()                      # writes the history record; later calls rewrite the same file
     """
 
     def __init__(self, cfg: dict, text: str, context: ProjectContext | None,
@@ -424,178 +471,291 @@ class CoachSession:
         self.context = context
         self.model = model
         self.out_lang = out_lang
-        self.rules = load_rules(cfg)
-        self.context_text, self.warnings = ("", [])
+        self.target = load_target(cfg)
+        self.text_lang = guess_language(self.text)
+        self.entries: list[GlossaryEntry] = parse_glossary(context.body) if context else []
+        self.warnings: list[str] = []
+        self._known_text = ""
         if context:
-            self.context_text, self.warnings = context.render(cfg["include_max_chars"])
-        if not self.rules:
-            self.warnings.append(f"rules file not found: {resolve(cfg['rules_file'])}")
-        self.rounds: list[Round] = []
-        self.messages: list[dict] = []
-        self.asked_codes: set[str] = set()
+            self._known_text, self.warnings = context.render(cfg["include_max_chars"])
+        self.context_text = self._fit_context()
+        self.round: Round | None = None
         self.result: Result | None = None
+        self.translation: Translation | None = None
+        self.copied: dict | None = None
+        self._path: Path | None = None
+        self._time = ""
 
     # ---- stage 1
 
-    def _lang_hint(self) -> str:
-        turkish = sum(self.text.count(ch) for ch in "çğıöşüÇĞİÖŞÜ")
-        return "it looks Turkish" if turkish >= 2 else "detect it from the text"
+    def _system(self, context_text: str) -> str:
+        lang = {"tr": "Turkish", "en": "English"}.get(self.text_lang, "the language of the user's text")
+        head = UNDERSTAND_SYSTEM.format(
+            target=self.target["name"], max_q=self.cfg["max_questions"], lang=lang,
+            address_note=TURKISH_ADDRESS_NOTE if self.text_lang == "tr" else "")
+        return head + "\n\n\n" + _shared_sections(self.context, context_text)
 
-    def _system_understand(self) -> str:
-        head = UNDERSTAND_SYSTEM.format(max_q=self.cfg["max_questions"], lang_hint=self._lang_hint())
-        return head + "\n\n" + _shared_sections(self.rules, self.context, self.context_text)
+    def _user_message(self) -> str:
+        return "THE USER'S TEXT:\n<<<\n" + self.text + "\n>>>"
 
-    def set_correction(self, text: str) -> None:
-        if self.rounds:
-            self.rounds[-1].correction = text.strip()
+    def _fit_context(self) -> str:
+        """Cut the context so that system prompt, context and text fit into num_ctx."""
+        budget = int((self.cfg["num_ctx"] - OUTPUT_RESERVE) * CHARS_PER_TOKEN)
+        room = budget - len(self._system("")) - len(self._user_message())
+        if room < 0:
+            raise CoachError(
+                f"The text is too long for the model's context (about {budget - room} characters "
+                f"against room for {budget}, num_ctx {self.cfg['num_ctx']}). Shorten it or raise "
+                f"num_ctx in config.json.")
+        text = self._known_text
+        if len(text) > room:
+            text = text[:room]
+            self.warnings.append(
+                f"context cut to {room} characters to fit num_ctx {self.cfg['num_ctx']}; "
+                f"raise num_ctx in config.json to read all of it")
+        return text
+
+    def set_note(self, text: str) -> None:
+        if self.round:
+            self.round.note = text.strip()
 
     def understand(self) -> Round:
-        if not self.messages:
-            self.messages = [
-                {"role": "system", "content": self._system_understand()},
-                {"role": "user", "content": "THE USER'S TEXT:\n<<<\n" + self.text + "\n>>>"},
-            ]
-        else:
-            last = self.rounds[-1]
-            self.messages.append({"role": "assistant", "content": json.dumps({
-                "understanding": last.understanding,
-                "repaired_text": last.repaired_text,
-                "questions": [{"question": q.question, "why": q.why} for q in last.questions],
-            }, ensure_ascii=False)})
-            self.messages.append({"role": "user", "content": self._answers_message(last)})
-
-        data, stats = chat_json(self.cfg, self.model, self.messages, UNDERSTAND_SCHEMA,
+        messages = [
+            {"role": "system", "content": self._system(self.context_text)},
+            {"role": "user", "content": self._user_message()},
+        ]
+        data, stats = chat_json(self.cfg, self.model, messages, UNDERSTAND_SCHEMA,
                                 self.cfg["temperature_understand"])
-        questions = [Question(str(q.get("question", "")).strip(), str(q.get("why", "")).strip())
-                     for q in data.get("questions") or [] if str(q.get("question", "")).strip()]
-        questions = questions[: self.cfg["max_questions"]]
-        questions += self._term_check_questions(questions)
-        rnd = Round(
-            understanding=str(data.get("understanding", "")).strip(),
-            repaired_text=str(data.get("repaired_text", "")).strip() or self.text,
-            questions=questions,
-            stats=stats,
-        )
-        self.rounds.append(rnd)
-        return rnd
+        keep_dash = EM_DASH in self.text
+        fix = (lambda t: t) if keep_dash else _no_em_dash
 
-    def _answers_message(self, last: Round) -> str:
-        lines = ["THE USER'S ANSWERS:"]
-        answered = [q for q in last.questions if q.answer.strip()]
-        skipped = [q for q in last.questions if not q.answer.strip()]
-        for i, q in enumerate(answered, 1):
-            lines.append(f"{i}. Q: {q.question}\n   A: {q.answer.strip()}")
-        if skipped:
-            lines.append("Skipped by the user (do not ask these again): "
-                         + "; ".join(q.question for q in skipped))
-        if last.correction:
-            lines.append("CORRECTION FROM THE USER: " + last.correction)
-        lines.append("Update the understanding and the repaired text with these facts. "
-                     "Ask only what is still unclear; return an empty list if nothing is.")
-        return "\n".join(lines)
-
-    def _term_check_questions(self, model_questions: list[Question]) -> list[Question]:
-        known = self.context_text + "\n" + "\n".join(
-            q.question + " " + q.answer for r in self.rounds for q in r.questions)
-        asked_now = " ".join(q.question for q in model_questions)
-        extra = []
-        for code in unknown_codes(self.text, known):
-            if code in self.asked_codes or code in asked_now:
+        model_questions = []
+        for q in data.get("questions") or []:
+            if not isinstance(q, dict):
                 continue
-            self.asked_codes.add(code)
-            extra.append(Question(
-                question=self._code_question(code),
-                why="Not defined in the selected project context.",
-                source="term-check",
-            ))
-        for q in model_questions:
-            for code in CODE_RE.findall(q.question):
-                self.asked_codes.add(code)
-        return extra
+            question = fix(str(q.get("question", "")).strip())
+            if not question or q.get("kind") == "choice":
+                continue
+            model_questions.append(Question(question, missing=str(q.get("missing", "")).strip()))
+        model_questions = model_questions[: self.cfg["max_questions"]]
+
+        checks, more = self._term_checks(model_questions)
+        depth = data.get("depth")
+        self.round = Round(
+            understanding=fix(str(data.get("understanding", "")).strip()),
+            questions=checks + model_questions,
+            depth=depth if depth in DEPTHS else "standard",
+            stats=stats,
+            more_terms=more,
+        )
+        return self.round
+
+    def _term_checks(self, model_questions: list[Question]) -> tuple[list[Question], list[str]]:
+        asked = " ".join(q.question for q in model_questions)
+        codes = [c for c in unknown_codes(self.text, self._known_text, self.entries) if c not in asked]
+        checks = [Question(self._code_question(c), missing="Not defined in the selected project context.",
+                           source="term-check", term=c) for c in codes[:MAX_TERM_CHECKS]]
+        return checks, codes[MAX_TERM_CHECKS:]
 
     def _code_question(self, code: str) -> str:
-        if self._lang_hint() == "it looks Turkish":
+        if self.text_lang == "tr":
             return f"“{code}” neyi ifade ediyor?"
         return f"What does “{code}” refer to here?"
 
-    @property
-    def all_questions(self) -> list[Question]:
-        return [q for r in self.rounds for q in r.questions]
+    # ---- build
 
-    # ---- stage 2
+    def _label_lang(self) -> str:
+        return self.text_lang
 
-    def compose(self) -> Result:
-        if not self.rounds:
-            raise CoachError("Stage 1 has not run yet.")
-        last = self.rounds[-1]
-        system = COMPOSE_SYSTEM.format(out_lang=_lang_instruction(self.out_lang)) + "\n\n" + \
-            _shared_sections(self.rules, self.context, self.context_text)
-        qa = [f"Q: {q.question}\nA: {q.answer.strip()}" for q in self.all_questions if q.answer.strip()]
-        corrections = [r.correction for r in self.rounds if r.correction]
-        user = "\n\n".join(filter(None, [
-            "THE USER'S ORIGINAL TEXT:\n<<<\n" + self.text + "\n>>>",
-            "REPAIRED TEXT:\n<<<\n" + last.repaired_text + "\n>>>",
-            "CONFIRMED UNDERSTANDING:\n" + last.understanding,
-            ("ANSWERS:\n" + "\n\n".join(qa)) if qa else "",
-            ("CORRECTIONS:\n" + "\n".join(corrections)) if corrections else "",
-        ]))
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        data, stats = chat_json(self.cfg, self.model, messages, COMPOSE_SCHEMA,
-                                self.cfg["temperature_compose"])
-        res = Result(
-            final_prompt=str(data.get("final_prompt", "")).strip(),
-            missing_context=[str(x).strip() for x in data.get("missing_context") or [] if str(x).strip()],
-            model=data.get("model") if data.get("model") in MODELS else "sonnet",
-            effort=data.get("effort") if data.get("effort") in EFFORTS else "medium",
-            reason=str(data.get("reason", "")).strip(),
+    def build(self) -> Result:
+        """The final prompt, built in code. No model call."""
+        if not self.round:
+            raise CoachError("The model has not been asked yet.")
+        rnd = self.round
+        self.translation = None  # a new build makes an old translation stale
+        segments = assemble(self.text, rnd.questions, rnd.note, self.entries, self._label_lang())
+        depth = rnd.depth if rnd.depth in DEPTHS else "standard"
+        pick = self.target["depths"][depth]
+        self.result = Result(
+            final_prompt=render(segments),
+            depth=depth,
+            model=pick["model"],
+            effort=pick.get("effort", ""),
+            terms=[e.key for e in attached_terms(self.text, rnd.note, rnd.questions, self.entries)],
             notes=[],
-            stats=stats,
         )
-        self._guardrails(res)
-        self.result = res
-        return res
+        return self.result
 
-    def _guardrails(self, res: Result) -> None:
-        """Deterministic checks the small model tends to get wrong."""
-        rank = EFFORTS.index
-        if res.model in ("opus", "opusplan") and rank(res.effort) < rank("high"):
-            res.notes.append(f"Effort raised from {res.effort} to high: {res.model} is for judgment work.")
-            res.effort = "high"
-        if len(self.all_questions) >= 2 and res.effort == "low":
-            res.notes.append("Effort raised from low to medium: the text needed clarification.")
-            res.effort = "medium"
-        if "\u2014" in res.final_prompt and "\u2014" not in self.text:
-            count = res.final_prompt.count("\u2014")
-            res.final_prompt = re.sub(r"\s*\u2014\s*", ", ", res.final_prompt)
-            res.notes.append(f"Replaced {count} em dash(es) with commas; check those sentences.")
-        if not res.final_prompt:
-            res.final_prompt = self.rounds[-1].repaired_text
-            res.notes.append("The model returned an empty prompt; showing the repaired text instead.")
+    # ---- translation
+
+    def needs_translation(self) -> bool:
+        code = LANG_CODES.get(self.out_lang)
+        return bool(code) and self.text_lang != code
+
+    def _translate_call(self, parts: dict[str, str], stats: list[CallStats]) -> dict[str, str]:
+        schema = {"type": "object",
+                  "properties": {k: {"type": "string"} for k in parts},
+                  "required": list(parts)}
+        messages = [
+            {"role": "system", "content": TRANSLATE_SYSTEM.format(language=self.out_lang)},
+            {"role": "user", "content": json.dumps(parts, ensure_ascii=False)},
+        ]
+        data, st = chat_json(self.cfg, self.model, messages, schema, 0.0)
+        stats.append(st)
+        if not isinstance(data, dict):
+            data = {}
+        out = {}
+        for k, source in parts.items():
+            value = str(data.get(k) or "")
+            if EM_DASH not in source:
+                value = _no_em_dash(value)
+            out[k] = value
+        return out
+
+    def translate(self, progress=None) -> Translation:
+        """Translate the final prompt into the output language. Model calls; may raise CoachError.
+
+        progress(done, total) is called after each batch."""
+        code = LANG_CODES.get(self.out_lang)
+        if not code:
+            raise CoachError("The output language is 'same', so there is nothing to translate.")
+        if not self.round:
+            raise CoachError("The model has not been asked yet.")
+        rnd = self.round
+        segments = assemble(self.text, rnd.questions, rnd.note, self.entries, code)
+
+        layout: list[tuple[str, str]] = []   # ("fixed", text) or ("part", key)
+        sources: dict[str, str] = {}         # key -> source part, only the parts that are sent
+        for kind, text in segments:
+            if kind != "user":
+                layout.append(("fixed", text))
+                continue
+            for part, sep in split_parts(text, PART_LIMIT):
+                if part.strip() and guess_language(part) != code:
+                    key = str(len(sources) + 1)
+                    sources[key] = part
+                    layout.append(("part", key))
+                else:
+                    layout.append(("fixed", part))
+                if sep:
+                    layout.append(("fixed", sep))
+
+        batches: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        size = 0
+        for key, part in sources.items():
+            if current and size + len(part) > BATCH_LIMIT:
+                batches.append(current)
+                current, size = {}, 0
+            current[key] = part
+            size += len(part)
+        if current:
+            batches.append(current)
+
+        stats: list[CallStats] = []
+        done: dict[str, str] = {}
+        kept: list[dict] = []
+        redo: list[str] = []
+        for n, batch in enumerate(batches, 1):
+            got = self._translate_call(batch, stats)
+            for key, source in batch.items():
+                if check_part(source, got[key], self.text_lang):
+                    redo.append(key)
+                else:
+                    done[key] = got[key]
+            if progress:
+                progress(n, len(batches))
+        for key in redo:  # one more try, alone
+            source = sources[key]
+            out = self._translate_call({key: source}, stats)[key]
+            problems = check_part(source, out, self.text_lang)
+            if problems:
+                done[key] = source
+                kept.append({"index": int(key), "problems": problems})
+            else:
+                done[key] = out
+        kept.sort(key=lambda k: k["index"])
+
+        text = "".join(done[v] if kind == "part" else v for kind, v in layout)
+        self.translation = Translation(self.out_lang, text, len(sources), kept, stats)
+        return self.translation
+
+    # ---- glossary
+
+    def new_terms(self) -> list[tuple[str, str]]:
+        """Answered term checks whose code the glossary does not cover yet."""
+        if not self.round:
+            return []
+        out = []
+        for q in self.round.questions:
+            answer = q.answer.strip()
+            if q.source != "term-check" or not answer or answer == "!":
+                continue
+            if unknown_codes(q.term, "", self.entries):
+                out.append((q.term, one_line(answer)))
+        return out
+
+    def save_terms(self) -> list[str]:
+        if not self.context:
+            raise CoachError("No project is selected, so there is no glossary to write to.")
+        written = self.context.add_terms(self.new_terms())
+        if written:
+            self.context.body = parse_context_file(self.context.path).body
+            self.entries = parse_glossary(self.context.body)
+        return written
 
     # ---- history
 
+    def mark_copied(self, text: str) -> None:
+        self.copied = {"text": text, "time": datetime.now().isoformat(timespec="seconds")}
+
+    def _record(self) -> dict:
+        def stats(st):
+            return None if st is None else {
+                "prompt_tokens": st.prompt_tokens, "output_tokens": st.output_tokens,
+                "seconds": round(st.seconds, 2), "gen_seconds": round(st.gen_seconds, 2),
+                "num_ctx": st.num_ctx}
+
+        rounds = []
+        if self.round:
+            r = self.round
+            rounds.append({
+                "understanding": r.understanding, "depth": r.depth, "note": r.note,
+                "questions": [{"question": q.question, "missing": q.missing, "answer": q.answer,
+                               "source": q.source, "term": q.term} for q in r.questions],
+                "stats": stats(r.stats),
+            })
+        return {
+            "format": 2,
+            "app_version": _app_version(),
+            "time": self._time,
+            "model_used": self.model,
+            "context": self.context.key if self.context else None,
+            "target": self.target["name"],
+            "output_language": self.out_lang,
+            "text_language": self.text_lang,
+            "original": self.text,
+            "rounds": rounds,
+            "result": None if not self.result else dict(self.result.__dict__),
+            "translation": None if not self.translation else {
+                "language": self.translation.language, "text": self.translation.text,
+                "parts": self.translation.parts, "kept": self.translation.kept,
+                "stats": [stats(st) for st in self.translation.stats]},
+            "copied": self.copied,
+        }
+
     def save(self) -> Path | None:
+        """Write the history record. The first call picks the file; later calls rewrite it."""
         folder = resolve(self.cfg["history_dir"])
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            path = folder / (datetime.now().strftime("%Y%m%d-%H%M%S") + ".json")
-            record = {
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "model_used": self.model,
-                "context": self.context.key if self.context else None,
-                "output_language": self.out_lang,
-                "original": self.text,
-                "rounds": [{
-                    "understanding": r.understanding,
-                    "repaired_text": r.repaired_text,
-                    "questions": [q.__dict__ for q in r.questions],
-                    "correction": r.correction,
-                } for r in self.rounds],
-                "result": None if not self.result else {
-                    k: v for k, v in self.result.__dict__.items() if k != "stats"},
-            }
-            path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-            return path
+            if self._path is None:
+                now = datetime.now()
+                self._time = now.isoformat(timespec="seconds")
+                self._path = folder / (now.strftime("%Y%m%d-%H%M%S") + ".json")
+            self._path.write_text(json.dumps(self._record(), ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+            return self._path
         except OSError:
             return None
 

@@ -1,7 +1,7 @@
 """Prompt coach, terminal UI. Keyboard driven; runs on the local Ollama model.
 
 Flow: pick a project context, write or paste the prompt, answer the coach's
-questions until its understanding is right, then copy the final prompt.
+questions once, then copy the final prompt. The prompt is built in code, with no second model call.
 
 Run:  python -B coach_tui.py      (needs: pip install textual)
 """
@@ -43,6 +43,9 @@ ROSE = "#f4a6c6"
 PEACH = "#f6c9a8"
 SHEEN = ["#a99cf0", "#c4b5fd", "#ddb8f2", "#f0b4e4", "#ddb8f2", "#c4b5fd", "#a99cf0"]
 
+ANSWER_PLACEHOLDER = "answer, or empty to skip, or ! to leave it to the assistant"
+NOTE_PLACEHOLDER = "anything to add or correct; it goes into the prompt as you write it"
+
 STEPS = [("write", "write"), ("clarify", "clarify"), ("result", "result")]
 
 # Shown in the empty prompt box, so a first-time user sees what to do without reading the README.
@@ -60,7 +63,7 @@ PROMPT_PLACEHOLDER = (
 FOOTER_HINTS = {
     "write": [("ctrl+s", "send"), ("f2", "paste"), ("tab", "focus"), ("f3", "model"),
               ("f4", "lang"), ("f1", "keys"), ("ctrl+q", "quit")],
-    "clarify": [("ctrl+s", "send"), ("ctrl+b", "build"), ("enter", "next"), ("esc", "back"),
+    "clarify": [("ctrl+s", "build"), ("ctrl+l", "delegate"), ("esc", "back"),
                 ("f1", "keys"), ("ctrl+q", "quit")],
     "result": [("y", "copy"), ("tab", "edit"), ("ctrl+n", "new"), ("esc", "back"),
                ("f1", "keys"), ("ctrl+q", "quit")],
@@ -68,7 +71,7 @@ FOOTER_HINTS = {
 
 HELP_TEXT = """\
 [b]anywhere[/b]
-  ctrl+s / f5   next step (send, send answers, confirm and build)
+  ctrl+s / f5   next step (send, build the prompt, copy)
   ctrl+n        new prompt
   f3            switch local model
   f4            output language: same, English, Turkish
@@ -81,13 +84,17 @@ HELP_TEXT = """\
   f2            replace the text with the clipboard
 
 [b]clarify[/b]
-  enter         next answer field; on the correction field, send
+  enter         next field; on the note field, build the prompt
   empty answer  skips the question
-  ctrl+b        build the final prompt now, without another round
+  !             as an answer: leave the question to the assistant
+  ctrl+l        write ! into the answer field and move on
   esc           back to the text
 
 [b]result[/b]
-  y / ctrl+y    copy the final prompt (your edits included)
+  y / ctrl+y    copy the text on screen (your edits included)
+  o             switch between the original and the translation
+  t             translate again (after an error, or after f4 changed the language)
+  g             save the new terms to the glossary of the project
   tab           edit the final prompt; ctrl+y copies while editing
   esc           back to clarify
 
@@ -208,13 +215,16 @@ class CoachApp(App):
 
     BINDINGS = [
         Binding("ctrl+s,f5", "next", "next", priority=True),
-        Binding("ctrl+b", "build_now", "build now", priority=True),
+        Binding("ctrl+l", "delegate", "delegate", priority=True),
         Binding("ctrl+n", "new", "new", priority=True),
         Binding("f2", "paste_clipboard", "paste clipboard"),
         Binding("f3", "cycle_model", "model", priority=True),
         Binding("f4", "cycle_lang", "language", priority=True),
         Binding("question_mark,f1", "help", "keys"),
         Binding("y,ctrl+y", "copy", "copy"),
+        Binding("g", "save_terms", "save terms"),
+        Binding("o", "toggle_original", "original"),
+        Binding("t", "retranslate", "translate"),
         Binding("escape", "back", "back", priority=True),
         Binding("ctrl+q", "quit", "quit", priority=True),
     ]
@@ -235,6 +245,9 @@ class CoachApp(App):
         self.busy_label = ""
         self.ollama_ok: bool | None = None
         self.last_stats = ""
+        self.texts: dict[str, str] = {}      # "original" and "translation", as last shown or edited
+        self.result_view = "original"
+        self.translate_error = ""
 
     # ------------------------------------------------------------------ layout
 
@@ -257,13 +270,11 @@ class CoachApp(App):
                 with VerticalScroll(id="clarify"):
                     yield Static("what you mean", classes="section")
                     yield Static("", id="understanding", classes="prose")
-                    yield Static("repaired text", classes="section")
-                    yield Static("", id="repaired", classes="muted")
                     yield Static("", id="questions-title", classes="section")
                     yield Vertical(id="questions")
-                    yield Static("correction (optional)", classes="section")
-                    yield Input(placeholder="type what is wrong in the understanding, or leave empty",
-                                id="correction")
+                    yield Static("", id="more-terms", classes="muted")
+                    yield Static("note (optional)", classes="section")
+                    yield Input(placeholder=NOTE_PLACEHOLDER, id="note")
                 with Vertical(id="result"):
                     yield Static("", id="result-meta")
                     yield Static("final prompt", classes="section")
@@ -406,6 +417,9 @@ class CoachApp(App):
         self.state["out_lang"] = self.out_lang
         save_state(self.state)
         self.refresh_chrome()
+        if self.step == "result" and self.session and self.busy_since is None:
+            self.notify(f"Output language: {self.out_lang}. Press t to "
+                        + ("translate." if self.session.needs_translation() else "show the original."))
 
     def action_paste_clipboard(self) -> None:
         if self.step != "write":
@@ -422,8 +436,13 @@ class CoachApp(App):
         if self.busy_since is not None:
             return
         self.session = None
+        self.texts = {}
+        self.result_view = "original"
+        self.translate_error = ""
         self.query_one("#prompt", TextArea).load_text("")
-        self.query_one("#final", TextArea).load_text("")
+        final = self.query_one("#final", TextArea)
+        final.read_only = False
+        final.load_text("")
         self.last_stats = ""
         self.go("write")
         self.query_one("#prompt", TextArea).focus()
@@ -442,7 +461,7 @@ class CoachApp(App):
             self.go("clarify")
 
     def action_copy(self) -> None:
-        if self.step != "result":
+        if self.step != "result" or not self.session:
             return
         text = self.query_one("#final", TextArea).text
         if core.copy_to_clipboard(text):
@@ -450,6 +469,55 @@ class CoachApp(App):
         else:
             self.copy_to_clipboard(text)  # terminal OSC 52 fallback
             self.notify("Copied through the terminal (OSC 52).")
+        self.session.mark_copied(text)
+        self.session.save()
+
+    def _remember_view(self) -> None:
+        """Keep the edits made in the view that is on screen."""
+        if self.texts:
+            self.texts[self.result_view] = self.query_one("#final", TextArea).text
+
+    def _show_view(self, view: str) -> None:
+        self._remember_view()
+        self.result_view = view
+        self.query_one("#final", TextArea).load_text(self.texts[view])
+        self._show_result_meta()
+
+    def action_toggle_original(self) -> None:
+        if self.step != "result" or self.busy_since is not None or "translation" not in self.texts:
+            return
+        self._show_view("original" if self.result_view == "translation" else "translation")
+
+    def action_retranslate(self) -> None:
+        if self.step != "result" or not self.session or self.busy_since is not None:
+            return
+        if not self.session.needs_translation():
+            if self.session.translation is not None:
+                self.session.translation = None
+                self.texts.pop("translation", None)
+                if self.result_view == "translation":
+                    self._show_view("original")
+                self.session.save()
+                self._show_result_meta()
+            self.notify("Nothing to translate for this output language.")
+            return
+        self._remember_view()
+        self._start_translation()
+
+    def action_save_terms(self) -> None:
+        if self.step != "result" or not self.session or not self.context:
+            return
+        if not self.session.new_terms():
+            return
+        try:
+            written = self.session.save_terms()
+        except core.CoachError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.session.save()
+        if written:
+            self.notify(f"Saved to the glossary of {self.context.name}: {', '.join(written)}.")
+        self._show_result_meta()
 
     def action_next(self) -> None:
         if self.busy_since is not None:
@@ -457,18 +525,22 @@ class CoachApp(App):
         if self.step == "write":
             self._start_session()
         elif self.step == "clarify":
-            self._send_answers()
+            self._build()
         elif self.step == "result":
             self.action_copy()
 
-    def action_build_now(self) -> None:
-        if self.busy_since is None and self.step == "clarify" and self.session:
-            self._collect_answers()
-            self._run("building", self._compose_job)
+    def action_delegate(self) -> None:
+        """Write ! into the focused answer field and move on."""
+        if self.step != "clarify" or self.busy_since is not None:
+            return
+        field = self.focused
+        if isinstance(field, Input) and field in self.answer_inputs:
+            field.value = "!"
+            self.screen.focus_next()
 
     @on(Input.Submitted)
     def _input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "correction":
+        if event.input.id == "note":
             self.action_next()
         else:
             self.screen.focus_next()
@@ -488,20 +560,20 @@ class CoachApp(App):
         self._run("understanding", self._understand_job)
 
     def _collect_answers(self) -> None:
-        rnd = self.session.rounds[-1]
-        for q, inp in zip(rnd.questions, self.answer_inputs):
+        for q, inp in zip(self.session.round.questions, self.answer_inputs):
             q.answer = inp.value.strip()
-        self.session.set_correction(self.query_one("#correction", Input).value)
+        self.session.set_note(self.query_one("#note", Input).value)
 
-    def _send_answers(self) -> None:
-        if not self.session or not self.session.rounds:
+    def _build(self) -> None:
+        if not self.session or not self.session.round:
             return
         self._collect_answers()
-        rnd = self.session.rounds[-1]
-        if any(q.answer for q in rnd.questions) or rnd.correction:
-            self._run("understanding", self._understand_job)
-        else:
-            self._run("building", self._compose_job)  # nothing to add: understanding confirmed
+        try:
+            res = self.session.build()
+        except core.CoachError as exc:
+            self.notify(str(exc), severity="error", timeout=10)
+            return
+        self._show_result(res)
 
     def _run(self, label: str, job) -> None:
         self.busy_since = time.monotonic()
@@ -523,15 +595,6 @@ class CoachApp(App):
             return
         self.call_from_thread(self._show_round, rnd)
 
-    def _compose_job(self) -> None:
-        try:
-            res = self.session.compose()
-            self.session.save()
-        except core.CoachError as exc:
-            self.call_from_thread(self._failed, str(exc))
-            return
-        self.call_from_thread(self._show_result, res)
-
     def _failed(self, message: str) -> None:
         self._done()
         self.notify(message, severity="error", timeout=10)
@@ -539,7 +602,6 @@ class CoachApp(App):
 
     async def _show_round(self, rnd: core.Round) -> None:
         self.query_one("#understanding", Static).update(Text(rnd.understanding or "(empty)"))
-        self.query_one("#repaired", Static).update(Text(rnd.repaired_text))
         box = self.query_one("#questions", Vertical)
         await box.remove_children()
         self.answer_inputs = []
@@ -553,46 +615,133 @@ class CoachApp(App):
                 if q.source == "term-check":
                     label.append("  [term check]", style=MUTED)
                 widgets.append(Static(label, classes="question"))
-                if q.why:
-                    widgets.append(Static(Text(q.why), classes="why"))
-                inp = Input(placeholder="answer, or leave empty to skip")
+                inp = Input(placeholder=ANSWER_PLACEHOLDER)
                 self.answer_inputs.append(inp)
                 widgets.append(inp)
             await box.mount_all(widgets)
         else:
-            title.update("no open questions. ctrl+s confirms and builds the prompt")
-        self.query_one("#correction", Input).value = ""
+            title.update("no open questions. ctrl+s builds the prompt")
+        more = rnd.more_terms
+        self.query_one("#more-terms", Static).update(
+            Text(f"{len(more)} more project term(s) in the text were not asked about: {', '.join(more)}")
+            if more else "")
+        self.query_one("#note", Input).value = ""
         if rnd.stats:
             self.last_stats = rnd.stats.line()
         self._done()
         self.go("clarify")
         self.query_one("#clarify", VerticalScroll).scroll_home(animate=False)
-        (self.answer_inputs[0] if self.answer_inputs else self.query_one("#correction", Input)).focus()
+        (self.answer_inputs[0] if self.answer_inputs else self.query_one("#note", Input)).focus()
 
-    def _show_result(self, res: core.Result) -> None:
+    def _show_result_meta(self) -> None:
+        sess = self.session
+        res = sess.result
         meta = Text()
-        meta.append("model ", style=MUTED)
+        meta.append("depth ", style=MUTED)
+        meta.append(res.depth, style=f"bold {VIOLET}")
+        meta.append("   model ", style=MUTED)
         meta.append(res.model, style=f"bold {VIOLET}")
-        meta.append("   effort ", style=MUTED)
-        meta.append(res.effort, style=f"bold {VIOLET}")
-        if res.reason:
-            meta.append("\n" + res.reason, style=TEXT)
+        if res.effort:
+            meta.append("   effort ", style=MUTED)
+            meta.append(res.effort, style=f"bold {VIOLET}")
+        if res.terms:
+            meta.append(f"\n{len(res.terms)} project terms attached: {', '.join(res.terms)}", style=TEXT)
+        new = sess.new_terms()
+        if new and self.context:
+            codes = ", ".join(code for code, _ in new)
+            meta.append(f"\nnew terms: {codes}. g saves them to the glossary of {self.context.name}",
+                        style=MINT)
         for n in res.notes:
             meta.append("\n• " + n, style=PEACH)
-        if res.missing_context:
-            meta.append("\nstill missing", style=f"bold {ROSE}")
-            for item in res.missing_context:
-                meta.append("\n  - " + item, style=ROSE)
+        meta.append(self._translation_line())
         self.query_one("#result-meta", Static).update(meta)
+
+    def _translation_line(self) -> Text:
+        sess = self.session
+        line = Text()
+        tr = sess.translation
+        if self.busy_label.startswith("translating") and self.busy_since is not None:
+            line.append(f"\ntranslating to {sess.out_lang}. The original stays here until it is done.",
+                        style=PEACH)
+        elif self.translate_error:
+            line.append(f"\ntranslation failed: {self.translate_error} t tries again.", style=ROSE)
+        elif tr:
+            ok = tr.parts - len(tr.kept)
+            if tr.kept:
+                kept = "; ".join(f"part {k['index']} ({', '.join(k['problems'])})" for k in tr.kept)
+                line.append(f"\ntranslated to {tr.language}: {ok} of {tr.parts} parts passed the checks. "
+                            f"Kept in the original language: {kept}. o shows the original", style=PEACH)
+            else:
+                line.append(f"\ntranslated to {tr.language}: {ok} of {tr.parts} parts passed the checks. "
+                            "A wrong idiom can still slip through; o shows the original", style=MINT)
+            line.append(f"\nshowing the {self.result_view}", style=MUTED)
+        return line
+
+    def _auto_copy(self, text: str, message: str) -> None:
+        if core.copy_to_clipboard(text):
+            self.session.mark_copied(text)
+            self.notify(message)
+
+    def _show_result(self, res: core.Result) -> None:
+        self.texts = {"original": res.final_prompt}
+        self.result_view = "original"
+        self.translate_error = ""
         final = self.query_one("#final", TextArea)
+        final.read_only = False
         final.load_text(res.final_prompt)
-        if res.stats:
-            self.last_stats = res.stats.line()
-        self._done()
+        self._show_result_meta()
         self.go("result")
         self.set_focus(None)  # so "y" copies; tab moves into the text to edit it
-        if core.copy_to_clipboard(res.final_prompt):
-            self.notify("Final prompt copied. Edit it here and press y or ctrl+y to copy again.")
+        if self.session.needs_translation():
+            self.session.save()
+            self._start_translation()
+            return
+        self._auto_copy(res.final_prompt,
+                        "Final prompt copied. Edit it here and press y or ctrl+y to copy again.")
+        self.session.save()
+
+    # ------------------------------------------------------------------ translation
+
+    def _start_translation(self) -> None:
+        """Translate in a worker. The original stays visible and read-only until it ends."""
+        self.translate_error = ""
+        self.busy_since = time.monotonic()
+        self.busy_label = "translating"
+        self.query_one("#final", TextArea).read_only = True
+        self.refresh_chrome()
+        self._show_result_meta()
+        self.run_worker(self._translate_job, thread=True, exclusive=True, group="llm")
+
+    def _translate_progress(self, done: int, total: int) -> None:
+        self.busy_label = f"translating {done}/{total}"
+
+    def _translate_job(self) -> None:
+        try:
+            tr = self.session.translate(progress=self._translate_progress)
+        except core.CoachError as exc:
+            self.call_from_thread(self._translate_failed, str(exc))
+            return
+        self.call_from_thread(self._translate_done, tr)
+
+    def _translate_failed(self, message: str) -> None:
+        self._done()
+        self.query_one("#final", TextArea).read_only = False
+        self.translate_error = message
+        self.notify(message, severity="error", timeout=10)
+        self._show_result_meta()
+        self._recheck_ollama()
+
+    def _translate_done(self, tr: core.Translation) -> None:
+        self._done()
+        final = self.query_one("#final", TextArea)
+        final.read_only = False
+        self.texts["translation"] = tr.text
+        self.result_view = "translation"
+        final.load_text(tr.text)
+        self._show_result_meta()
+        self.session.save()
+        self._auto_copy(tr.text, f"Translation ({tr.language}) copied. o shows the original.")
+        self.session.save()
 
 
 def update_notice(label: str, app_dir=None) -> str:

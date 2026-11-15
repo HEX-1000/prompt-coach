@@ -76,6 +76,7 @@ class ZipUpdateTests(unittest.TestCase):
     def new_remote(self, version="1.1.0", **extra):
         files = {
             "coach_core.py": GOOD_PY,
+            "coach_text.py": GOOD_PY,
             "coach_tui.py": GOOD_PY,
             "config.json": '{"models": ["upstream"]}',
             "requirements.txt": "textual>=8.2,<9\n",

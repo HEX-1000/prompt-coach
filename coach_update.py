@@ -52,7 +52,7 @@ PROTECTED_FILES = {".state.json", "config.json"}
 # Inside contexts/ and rules/ only these shipped files are updated; the rest is the user's.
 SHIPPED_IN_USER_DIRS = {"contexts/_template.md", "rules/README.md"}
 USER_DIRS = {"contexts", "rules"}
-REQUIRED_FILES = ("VERSION", "coach_core.py", "coach_tui.py")
+REQUIRED_FILES = ("VERSION", "coach_core.py", "coach_text.py", "coach_tui.py")
 
 
 class UpdateError(Exception):
