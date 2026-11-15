@@ -4,7 +4,7 @@ What changed in each version, newest first. After an update the app shows the en
 between your old version and the new one. Keep each entry to one short line a user can
 understand. The version number lives in `VERSION`; raising it is what makes an update reach everyone.
 
-## Unreleased
+## 2.1.0
 
 - With a project selected, the final prompt carries the project's brief under "Project context". The brief is the text above the glossary in your project file, so check what yours says.
 - `b` on the result screen removes the brief or adds it again and copies the result. The choice is remembered per project. The plain terminal version has `--no-brief`.
