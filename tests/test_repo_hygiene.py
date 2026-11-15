@@ -1,4 +1,4 @@
-"""Repository rules: no em dash, Windows-safe scripts, a plain VERSION file, personal data ignored.
+"""Repository rules: no em dash, LF line endings, Windows-safe scripts, a plain VERSION file, personal data ignored.
 
 python -B -m unittest discover -s tests
 """
@@ -16,6 +16,8 @@ import coach_update  # noqa: E402
 
 EM_DASH = chr(0x2014)
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".yml", ".yaml", ".toml", ".ps1", ".cmd", ".svg", ""}
+# cmd.exe scripts keep CRLF line endings; every other text file uses LF.
+CRLF_SUFFIXES = {".cmd"}
 # rules/ holds the user's communication rules, which contain the character on purpose.
 # contexts/ holds the user's own glossaries.
 EXCLUDED_DIRS = {"rules", "contexts"}
@@ -65,6 +67,19 @@ class RepoHygieneTests(unittest.TestCase):
                 continue
             if EM_DASH in path.read_text(encoding="utf-8", errors="ignore"):
                 offenders.append(rel)
+        self.assertEqual(offenders, [])
+
+    @unittest.skipUnless(is_checkout(), "needs a git checkout")
+    def test_text_files_use_lf_line_endings(self):
+        # .gitattributes turns line ending conversion off, so a file an editor saved with CRLF is
+        # committed with CRLF, and every line of it then shows as changed.
+        offenders = []
+        for path in tracked_files():
+            suffix = path.suffix.lower()
+            if suffix not in TEXT_SUFFIXES or suffix in CRLF_SUFFIXES:
+                continue
+            if b"\r" in path.read_bytes():
+                offenders.append(relative(path))
         self.assertEqual(offenders, [])
 
     def test_powershell_scripts_are_plain_ascii(self):
