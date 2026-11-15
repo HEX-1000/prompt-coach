@@ -10,7 +10,7 @@
   <img alt="Runs on Ollama" src="https://img.shields.io/badge/runs%20on-Ollama-f4a6c6?style=flat-square&labelColor=16131f">
 </p>
 
-Prompt Coach checks a prompt before you send it to Claude. A local model, run by Ollama, restates what you mean, repairs the text and asks about anything unclear instead of guessing. Once the meaning is settled, it gives you the final prompt and recommends which Claude model and effort level to use.
+Prompt Coach checks a prompt before you send it to Claude. A local model, run by Ollama, restates what you mean and asks about anything unclear instead of guessing. Then the app builds the final prompt from your own text and your answers, and recommends which Claude model and effort level to use.
 
 It runs on your PC, so it uses no Claude usage, and nothing leaves your machine.
 
@@ -21,8 +21,12 @@ How much a request costs depends mostly on two things: how many rounds it takes 
 ## How it works
 
 1. **Write.** The app opens in **General Context**, ready to type. The empty prompt box lists the first keys to know. To use a project's glossary, press `tab` and pick the project from the **PROJECTS** list. Then type or paste your prompt and press `ctrl+s`.
-2. **Clarify.** The coach restates what you mean, shows the repaired text and asks what it needs to know. Codes such as `D5` or `A02` that are not in the project context are always asked about, never guessed ("term check"). Answer, leave a field empty to skip, or type a correction. `ctrl+s` sends the answers. When the understanding is right and nothing is open, `ctrl+s` builds the prompt.
-3. **Result.** You get the final prompt, the recommended Claude model and effort, and anything still missing. The prompt is already on the clipboard; edit it in place and copy again with `y` or `ctrl+y`.
+2. **Clarify.** One model call restates what you mean and asks up to 3 questions. Codes such as `D5` or `A02` that are not in the project glossary are always asked about, never guessed ("term check"). In a question field, type an answer, press Enter or leave it empty to skip, or type `!` (or press `ctrl+l`) to leave the question to the assistant. The note field takes anything you want to add or correct. `ctrl+s` builds the prompt.
+3. **Result.** The final prompt is your text unchanged, then your note, your answers, the questions left to the assistant and the glossary lines of the terms it uses. Code builds it, not the model, so nothing in your text is dropped or reworded. You also get the recommended Claude model and effort. The prompt is already on the clipboard; edit it in place and copy again with `y` or `ctrl+y`.
+
+If the output language (`f4`) differs from the language of your text, the prompt is translated part by part and every part is checked for dropped numbers, URLs and codes, and for a part left untranslated. `o` shows the original and `t` translates again. The checks cannot see a wrong idiom or a clause attached to the wrong noun, so read the translation before you send it. Leaving the language on `same` skips the translation.
+
+If you answered a term check and a project is selected, `g` adds the term to that project's glossary.
 
 Each finished run is saved to `history/` as JSON, on your PC only.
 
@@ -32,10 +36,10 @@ Each finished run is saved to `history/` as JSON, on your PC only.
 - Python 3.10 or newer, from [python.org](https://www.python.org/downloads/)
 - [Ollama](https://ollama.com/download) with at least one model:
 
-| Model | VRAM at the default 16K context | Measured on an RTX 3050 8 GB |
+| Model | VRAM at the default 8K context | Measured on an RTX 3050 8 GB |
 |---|---|---|
-| `qwen3.5:9b` (default) | about 6.5 GB | 32 tokens/s, partly on the CPU |
-| `qwen3.5:4b` | about 3.4 GB | 57 tokens/s, fully on the GPU |
+| `qwen3.5:9b` (default) | about 5.6 GB | 35 tokens/s, fully on the GPU |
+| `qwen3.5:4b` | about 3.3 GB | 55 tokens/s, fully on the GPU |
 
 ## Install
 
@@ -65,7 +69,7 @@ It creates a Python environment in `.venv` with [Textual](https://textual.textua
 
 At the end it checks that Ollama is installed and running and that one of the models in `config.json` is downloaded. Anything missing is listed under **Before you start**, with the command to fix it. These checks only warn; the app is installed either way. The installer uses the newest Python 3.10 or newer it finds: first the Python install manager's folder, then the `py` launcher, then `python` on PATH. If there is none, or the one it finds is older than 3.10, it stops with a link to the download.
 
-**5. Add a project context (optional).** Copy `contexts\_template.md` to a new file, for example `contexts\my-project.md`, and fill in the project name, a one-line description and a glossary of your own terms. The `name:` line is what the PROJECTS list shows. The coach reads the context before every run, so it knows what your abbreviations mean. Optional `include:` paths, such as a project's `CLAUDE.md`, are read fresh each time. Without any context file, General Context is all you see, and every project term gets asked about.
+**5. Add a project context (optional).** Copy `contexts\_template.md` to a new file, for example `contexts\my-project.md`, and fill in the project name, a one-line description and a glossary of your own terms (a list under a `## Glossary` heading, one `- TERM: meaning` per line). The `name:` line is what the PROJECTS list shows. The coach reads the context before every run, so it knows what your abbreviations mean, and it attaches the glossary lines of the terms your prompt uses. Optional `include:` paths, such as a project's `CLAUDE.md`, are read fresh each time. Without any context file, General Context is all you see, and every project term gets asked about.
 
 **6. Start it** from the desktop shortcut, or open Windows Terminal and choose **Prompt Coach**.
 
@@ -73,13 +77,16 @@ At the end it checks that Ollama is installed and running and that one of the mo
 
 | Key | Action |
 |---|---|
-| `ctrl+s` or `f5` | next step |
-| `ctrl+b` | build the prompt now |
+| `ctrl+s` or `f5` | next step (build, on the clarify screen) |
+| `ctrl+l` | leave this question to the assistant (types `!`) |
 | `ctrl+n` | new prompt |
 | `f2` | paste from the clipboard |
 | `f3` | switch model |
 | `f4` | output language: same, English, Turkish |
 | `y` or `ctrl+y` | copy the result |
+| `o` | result: switch between the original and the translation |
+| `t` | result: translate again |
+| `g` | result: save answered term checks to the project glossary |
 | `esc` | back |
 | `f1` | all keys (`?` also works when the cursor is not in a text box) |
 | `ctrl+q` | quit |
@@ -89,15 +96,18 @@ At the end it checks that Ollama is installed and running and that one of the mo
 | File | Purpose |
 |---|---|
 | `coach_tui.py` | the terminal app |
-| `coach_core.py` | shared logic: contexts, the two stages, clipboard |
+| `coach_core.py` | shared logic: config, contexts, the session (understand, build, translate, save), clipboard |
+| `coach_text.py` | text functions without side effects: language guess, glossary, prompt assembly, translation checks |
+| `targets/claude.json` | which Claude model and effort go with each depth label |
 | `coach_update.py` | the launch-time update check, see [Updates](#updates) |
 | `VERSION` | the installed version, compared with the one on GitHub |
 | `CHANGELOG.md` | what changed in each version, newest first |
 | `tests/` | `python -B -m unittest discover -s tests`; GitHub runs them on Windows and Linux with Python 3.10 and 3.12 |
 | `prompt_coach.py` | plain terminal version, standard library only: `python -B prompt_coach.py --project my-project "your prompt"` |
 | `contexts/*.md` | one file per project; files starting with `_` are not listed |
-| `rules/` | optional writing rules, see [rules/README.md](rules/README.md) |
-| `config.json` | Ollama address, models, context size, temperatures, question limit |
+| `rules/` | no longer used, see [rules/README.md](rules/README.md) |
+| `tools/replay.py` | local tool: scores saved history records and replays the pipeline on them (`--saved` needs no model) |
+| `config.json` | Ollama address, models, context size, temperature, question limit, target |
 | `prompt_coach_v1.py` | the earlier single-stage script, kept for comparison |
 
 ## Updates
@@ -116,11 +126,13 @@ Updating means running code downloaded from this repository, so the repository o
 
 ## Privacy
 
-The coach talks only to Ollama on `localhost`. The one other connection is the update check above: plain requests to `raw.githubusercontent.com` and `github.com`, with no prompt, context or history in them. Your contexts, rules and history stay in this folder, and `.gitignore` keeps them out of Git if you fork the repository.
+The coach talks only to Ollama on `localhost`. The one other connection is the update check above: plain requests to `raw.githubusercontent.com` and `github.com`, with no prompt, context or history in them. Your contexts and history stay in this folder, and `.gitignore` keeps them out of Git if you fork the repository.
 
 ## Limitations
 
-- The coach is a small local model. Its questions and its model recommendation are good defaults, not guarantees; read the result before you send it.
+- The coach is a small local model. Its questions and its depth label are good defaults, not guarantees; read the result before you send it. In a trial on four saved prompts, 15 of 27 kept questions were worth asking.
+- A translation can carry a wrong meaning that the checks cannot see. It is off by default (`same`).
+- The context window is 8192 tokens. A project context that does not fit is cut at the end, with a warning; raise `num_ctx` in `config.json` and add `"config_version": 2` to read more.
 - The installer and the clipboard code are for Windows.
 - Ollama must be running. If it is not, the app shows a red dot and a notice, and checks again when you press `ctrl+s`. If Ollama is not installed at all, the notice gives the download link.
 - The app warns only about the model it is set to use. If that model is not downloaded, the notice gives the `ollama pull` command and, when another model from `config.json` is installed, points to `f3`.

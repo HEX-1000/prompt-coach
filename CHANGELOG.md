@@ -4,6 +4,19 @@ What changed in each version, newest first. After an update the app shows the en
 between your old version and the new one. Keep each entry to one short line a user can
 understand. The version number lives in `VERSION`; raising it is what makes an update reach everyone.
 
+## 2.0.0
+
+- One model call instead of several: the coach restates what you mean and asks up to 3 questions. It no longer rewrites your text.
+- Your text goes into the final prompt unchanged, followed by your note, your answers and the glossary lines of the terms it uses. The model does not write the prompt, so nothing is lost or reworded.
+- In the question fields, Enter skips and `!` (or `ctrl+l`) leaves the question to the assistant. The note field takes anything you want to add.
+- Output language English or Turkish translates the prompt part by part and checks every part. `o` shows the original, `t` translates again.
+- `g` on the result screen saves answered term checks to the glossary of the project.
+- The model and effort come from `targets/claude.json`, not from the model.
+- The default context is 8192 tokens and the default is 3 questions. A long project context is cut with a warning instead of being cut silently.
+- History records have format 2 with the app version, timings and what you copied. Older records still read.
+- The coach no longer reads `rules/communication_rules.md`, and `rules_file` and `temperature_compose` in `config.json` are ignored.
+- `tools/replay.py` scores saved records and replays the pipeline on them. It is a local tool, not part of the app.
+
 ## 1.3.0
 
 - After an update the app lists what changed since your version.

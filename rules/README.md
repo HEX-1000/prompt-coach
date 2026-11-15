@@ -1,5 +1,5 @@
-# Writing rules (optional)
+# Writing rules (not used since 2.0.0)
 
-Put your own writing rules in `rules/communication_rules.md`, for example how you want text phrased and what to avoid. The coach follows them in its own output and when it repairs your prompt. They are not added to the final prompt, because your Claude project or chat instructions already carry them.
+Prompt Coach no longer reads a rules file. It does not rewrite your text or write the final prompt any more, so it has no use for writing rules. A file you already have in this folder, such as `communication_rules.md`, stays where it is and is ignored, as is `rules_file` in `config.json`.
 
-Without this file the coach works the same, with its default style. The path can be changed with `rules_file` in `config.json`.
+Keep your writing rules in your Claude project or chat instructions, where they apply to Claude's answers.
