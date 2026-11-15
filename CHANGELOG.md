@@ -4,6 +4,11 @@ What changed in each version, newest first. After an update the app shows the en
 between your old version and the new one. Keep each entry to one short line a user can
 understand. The version number lives in `VERSION`; raising it is what makes an update reach everyone.
 
+## Unreleased
+
+- Questions are filtered before you see them. The model now quotes the sentence that states each fact it asks about; a question is dropped when that sentence is in your text or your project file. Questions that ask you to send material or to make a choice are dropped too.
+- Each history record keeps the dropped questions under `rounds[].dropped`, with the reason.
+
 ## 2.1.0
 
 - With a project selected, the final prompt carries the project's brief under "Project context". The brief is the text above the glossary in your project file, so check what yours says.

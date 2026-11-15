@@ -22,8 +22,8 @@ def reply(understanding="You want Claude to shorten the text.", questions=(), de
     return {"understanding": understanding, "questions": list(questions), "depth": depth}
 
 
-def q(question, kind="fact", missing="a fact"):
-    return {"missing": missing, "question": question, "kind": kind}
+def q(question, kind="fact", missing="a fact", quote=""):
+    return {"missing": missing, "quote": quote, "question": question, "kind": kind}
 
 
 class TempDirCase(unittest.TestCase):
@@ -184,6 +184,55 @@ class UnderstandTests(TempDirCase):
             q("Which license do you want?", kind="choice"), q("Is the repo public?")]))
         self.assertEqual([x.question for x in s.round.questions], ["Is the repo public?"])
 
+    def test_material_questions_are_dropped(self):
+        s = self.session("Text.", reply(questions=[q("Send the list?", kind="material"), q("Which file?")]))
+        self.assertEqual([x.question for x in s.round.questions], ["Which file?"])
+        self.assertEqual([(d["question"], d["reason"]) for d in s.round.dropped], [("Send the list?", "material")])
+
+    def test_unknown_kind_is_dropped_with_its_kind_as_reason(self):
+        s = self.session("Text.", reply(questions=[q("Odd?", kind="other")]))
+        self.assertEqual(s.round.questions, [])
+        self.assertEqual(s.round.dropped[0]["reason"], "other")
+
+    def test_quote_found_in_the_context_drops_the_question(self):
+        path = self.write("c.md", "Project notes.\nThe repo is public on GitHub.\n## Glossary\n- E1: first run\n")
+        ctx = core.parse_context_file(path)
+        data = reply(questions=[q("Is the repo public?", quote="The repo is public on GitHub."),
+                                q("Which branch?")])
+        s = self.session("Text.", data, context=ctx)
+        self.assertEqual([x.question for x in s.round.questions], ["Which branch?"])
+        d = s.round.dropped[0]
+        self.assertEqual((d["reason"], d["kind"], d["quote"], d["missing"]),
+                         ("stated", "fact", "The repo is public on GitHub.", "a fact"))
+
+    def test_quote_found_in_the_text_drops_the_question(self):
+        text = "Summarise the quarterly report for the board."
+        s = self.session(text, reply(questions=[q("Who reads it?", quote="for the board")]))
+        self.assertEqual(len(s.round.questions), 1)
+        s = self.session(text, reply(questions=[q("Who reads it?", quote="the quarterly report for the board")]))
+        self.assertEqual(s.round.questions, [])
+        self.assertEqual(s.round.dropped[0]["reason"], "stated")
+
+    def test_quote_not_found_keeps_the_question(self):
+        s = self.session("Summarise the report.", reply(questions=[q("Who reads it?", quote="The board reads it every week.")]))
+        self.assertEqual(len(s.round.questions), 1)
+        self.assertEqual(s.round.dropped, [])
+
+    def test_quote_ignores_case_and_white_space(self):
+        text = "Summarise the quarterly\n  report for the board."
+        s = self.session(text, reply(questions=[q("Who?", quote='  "SUMMARISE the quarterly report for the board" ')]))
+        self.assertEqual(s.round.questions, [])
+
+    def test_kind_decides_before_the_quote(self):
+        s = self.session("Text.", reply(questions=[q("Pick?", kind="choice", quote="not in any source")]))
+        self.assertEqual(s.round.dropped[0]["reason"], "choice")
+
+    def test_dropped_questions_do_not_count_against_the_limit(self):
+        qs = [q("c1?", "choice"), q("m1?", "material"), q("f1?"), q("f2?"), q("f3?"), q("f4?")]
+        s = self.session("Text.", reply(questions=qs))
+        self.assertEqual([x.question for x in s.round.questions], ["f1?", "f2?", "f3?"])
+        self.assertEqual([d["reason"] for d in s.round.dropped], ["choice", "material"])
+
     def test_empty_questions_are_dropped(self):
         s = self.session("Text.", reply(questions=[q("  "), q("Real one?")]))
         self.assertEqual([x.question for x in s.round.questions], ["Real one?"])
@@ -253,7 +302,10 @@ class UnderstandTests(TempDirCase):
         self.assertEqual(model, "test-model")
         self.assertEqual(temperature, 0.3)
         self.assertEqual(list(schema["properties"]), ["understanding", "questions", "depth"])
-        self.assertEqual(schema["properties"]["questions"]["items"]["required"], ["missing", "question", "kind"])
+        item = schema["properties"]["questions"]["items"]
+        self.assertEqual(list(item["properties"]), ["missing", "quote", "question", "kind"])
+        self.assertEqual(item["required"], ["missing", "quote", "question", "kind"])
+        self.assertEqual(item["properties"]["kind"]["enum"], ["fact", "material", "choice"])
         self.assertEqual([m["role"] for m in messages], ["system", "user"])
         self.assertTrue(messages[1]["content"].startswith("THE USER'S TEXT:\n<<<\nText."))
 
@@ -588,6 +640,13 @@ class HistoryTests(TempDirCase):
         self.assertIsNone(rec["translation"])
         self.assertIsNone(rec["copied"])
         self.assertTrue(rec["result"]["final_prompt"].startswith(rec["original"]))
+
+    def test_record_keeps_the_dropped_questions(self):
+        s = self.session("Text.", reply(questions=[q("Send it?", "material", quote="x"), q("Which?")]))
+        _, rec = self.saved(s)
+        self.assertEqual(rec["format"], 2)
+        self.assertEqual(rec["rounds"][0]["dropped"], [{"question": "Send it?", "missing": "a fact",
+                                                        "kind": "material", "quote": "x", "reason": "material"}])
 
     def test_save_before_build_has_no_result(self):
         _, rec = self.saved(self.session("Text.", reply()))

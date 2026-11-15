@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 from coach_text import (  # noqa: F401  (CODE_RE, COMMON_CODES, unknown_codes stay importable from here)
     CODE_RE, COMMON_CODES, GlossaryEntry, add_glossary_line, assemble, attached_terms,
     brief_from_body, check_part, clean_brief, cut_brief, guess_language, one_line, parse_glossary,
-    render, split_parts, unknown_codes,
+    quote_found, render, split_parts, unknown_codes,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -396,10 +396,11 @@ UNDERSTAND_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "missing": {"type": "string"},
+                    "quote": {"type": "string"},
                     "question": {"type": "string"},
-                    "kind": {"type": "string", "enum": ["fact", "choice"]},
+                    "kind": {"type": "string", "enum": ["fact", "material", "choice"]},
                 },
-                "required": ["missing", "question", "kind"],
+                "required": ["missing", "quote", "question", "kind"],
             },
         },
         "depth": {"type": "string", "enum": list(DEPTHS)},
@@ -412,13 +413,13 @@ UNDERSTAND_SYSTEM = """You check a text that a user is about to send to {target}
 understanding: Restate in two to five plain sentences what the user wants {target} to do, what {target} will work from, and what result the user expects. Write to the user in the second person ("You want {target} to ..."); never call them "the user". {target} does the work, so never write "I", "me" or "we".{address_note} State only what the text and the project context say. Do not mention your questions here.
 
 questions: Facts that {target} needs and that only the user knows. Good questions ask what a name, code or term means, which file, version, device, number, date or audience is meant, or what already exists. At most {max_q} questions, most useful first. An empty list is a good answer when the text is clear.
-For each question write "missing" first: at most 15 words that name the fact that is missing. Then write the question.
+For each question write "missing" first: at most 15 words that name the fact that is missing. Then write "quote": look in the text and in the project context for one sentence that states this fact, and copy that sentence word for word, in the language it is written in; write an empty string when no sentence states it. Then write the question.
 Rules for questions:
 - Never ask the user to make a choice that the text asks {target} to make. Never ask for a preference, an opinion or a decision the user has not made. Example: the text says "tell me which license to use". Do not ask "Which license do you want?", because choosing the license is {target}'s job.
 - Do not ask about anything the text or the project context already says.
 - Do not doubt what the user states about their own devices, files, versions, dates or work. The user knows these better than you do.
 - Do not ask about a term, code or name that the project context defines. If one is not defined, ask what it is; never expand it from general knowledge.
-- "kind" is "fact" when the user already knows the answer, and "choice" when the question asks the user to pick, prefer or decide something.
+- "kind" is one of three words. "material": the question asks the user to send, paste, list or attach something, such as a file, a list or a link. "choice": the question asks the user to pick, prefer or decide something. "fact": neither of the two, and the user already knows the answer.
 
 depth: how much reasoning the task needs from {target}.
 - "light": a lookup, a format change, a short rewrite, one simple fact.
@@ -465,6 +466,8 @@ class Round:
     depth: str = "standard"
     stats: CallStats | None = None
     more_terms: list[str] = field(default_factory=list)  # unknown codes that were not asked
+    # Model questions the filter removed: dicts with question, missing, kind, quote, reason.
+    dropped: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -608,13 +611,26 @@ class CoachSession:
         fix = (lambda t: t) if keep_dash else _no_em_dash
 
         model_questions = []
+        dropped = []
         for q in data.get("questions") or []:
             if not isinstance(q, dict):
                 continue
             question = fix(str(q.get("question", "")).strip())
-            if not question or q.get("kind") == "choice":
+            if not question:
                 continue
-            model_questions.append(Question(question, missing=str(q.get("missing", "")).strip()))
+            missing = str(q.get("missing", "")).strip()
+            kind = str(q.get("kind", "")).strip()
+            quote = str(q.get("quote", "")).strip()
+            reason = ""
+            if kind != "fact":
+                reason = kind or "unknown"
+            elif quote_found(quote, [self.context_text, self.text]):
+                reason = "stated"
+            if reason:
+                dropped.append({"question": question, "missing": missing, "kind": kind,
+                                "quote": quote, "reason": reason})
+                continue
+            model_questions.append(Question(question, missing=missing))
         model_questions = model_questions[: self.cfg["max_questions"]]
 
         checks, more = self._term_checks(model_questions)
@@ -625,6 +641,7 @@ class CoachSession:
             depth=depth if depth in DEPTHS else "standard",
             stats=stats,
             more_terms=more,
+            dropped=dropped,
         )
         return self.round
 
@@ -831,6 +848,7 @@ class CoachSession:
                 "questions": [{"question": q.question, "missing": q.missing, "answer": q.answer,
                                "source": q.source, "term": q.term} for q in r.questions],
                 "stats": stats(r.stats),
+                "dropped": r.dropped,
             })
         return {
             "format": 2,

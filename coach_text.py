@@ -26,6 +26,25 @@ def one_line(s: str) -> str:
     return " ".join(s.split())
 
 
+QUOTE_MIN_CHARS = 15
+_QUOTE_EDGE = " .\"'`“”‘’«»"
+
+
+def quote_found(quote: str, sources) -> bool:
+    """True when the quote has 15 or more characters and occurs in one of the sources.
+
+    Both sides are lower-cased and have their white space collapsed. Quotation marks, spaces
+    and periods are stripped from the ends of the quote.
+    """
+    def norm(t: str) -> str:
+        return " ".join(str(t).replace("İ", "i").lower().split())
+
+    q = norm(str(quote or "").strip().strip(_QUOTE_EDGE))
+    if len(q) < QUOTE_MIN_CHARS:
+        return False
+    return any(q in norm(src) for src in sources if src)
+
+
 # --------------------------------------------------------------------------- language
 
 _TR_WORDS = frozenset(

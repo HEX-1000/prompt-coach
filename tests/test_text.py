@@ -485,5 +485,30 @@ class CheckPartTests(unittest.TestCase):
         self.assertEqual(ct.check_part("Bu bir test", "Bu bir test ve bir", ""), [])
 
 
+class QuoteFoundTests(unittest.TestCase):
+    SRC = ["The repo is public on GitHub.", "Bu proje İstanbul'da\n  yürütülüyor."]
+
+    def test_found_in_either_source(self):
+        self.assertTrue(ct.quote_found("The repo is public on GitHub.", self.SRC))
+        self.assertTrue(ct.quote_found("Bu proje İstanbul'da yürütülüyor", self.SRC))
+
+    def test_case_and_white_space(self):
+        self.assertTrue(ct.quote_found("the   REPO is\npublic on github", self.SRC))
+
+    def test_edge_marks_are_stripped(self):
+        self.assertTrue(ct.quote_found(' “The repo is public on GitHub.”. ', self.SRC))
+
+    def test_not_found(self):
+        self.assertFalse(ct.quote_found("The repo is private on GitHub.", self.SRC))
+
+    def test_shorter_than_15_characters(self):
+        self.assertFalse(ct.quote_found("The repo is", self.SRC))
+        self.assertTrue(ct.quote_found("The repo is pub", self.SRC))
+        self.assertFalse(ct.quote_found("", self.SRC))
+
+    def test_empty_sources_are_skipped(self):
+        self.assertFalse(ct.quote_found("The repo is public on GitHub.", ["", None]))
+
+
 if __name__ == "__main__":
     unittest.main()

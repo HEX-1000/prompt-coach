@@ -191,32 +191,16 @@ def saved_questions(record: dict) -> tuple[list[core.Question], str]:
     return questions, " ".join(notes)
 
 
-class Spy:
-    """Records what the model returned, so dropped questions can be counted."""
-
-    def __init__(self) -> None:
-        self.raw: list = []
-        self._real = core.chat_json
-
-    def __enter__(self):
-        def wrapper(*args, **kwargs):
-            data, stats = self._real(*args, **kwargs)
-            self.raw.append(data)
-            return data, stats
-        core.chat_json = wrapper
-        return self
-
-    def __exit__(self, *exc):
-        core.chat_json = self._real
-
-
-def run_understand(cfg: dict, model: str, record: dict, samples: int) -> list[dict]:
+def run_understand(cfg: dict, model: str, record: dict, samples: int, contexts: dict | None = None) -> list[dict]:
+    """Stage 1 with the record's project context, as the app runs it."""
+    context = (contexts or {}).get(record.get("context") or "")
     rows = []
     for i in range(samples):
-        session = core.CoachSession(cfg, record["original"], None, model, "same")
-        with Spy() as spy:
-            rnd = session.understand()
-        raw = spy.raw[-1] if spy.raw and isinstance(spy.raw[-1], dict) else {}
+        session = core.CoachSession(cfg, record["original"], context, model, "same")
+        rnd = session.understand()
+        dropped = {}
+        for d in rnd.dropped:
+            dropped[d["reason"]] = dropped.get(d["reason"], 0) + 1
         model_kept = [q for q in rnd.questions if q.source == "model"]
         rows.append({
             "sample": i + 1,
@@ -225,8 +209,10 @@ def run_understand(cfg: dict, model: str, record: dict, samples: int) -> list[di
             "restatement_lang": ct.guess_language(rnd.understanding) or "?",
             "text_lang": session.text_lang,
             "questions_kept": len(model_kept),
-            "dropped_as_choice": sum(1 for q in (raw.get("questions") or [])
-                                     if isinstance(q, dict) and q.get("kind") == "choice"),
+            "context": context.key if context else None,
+            "questions_dropped": len(rnd.dropped),
+            "dropped_by_reason": dropped,
+            "dropped": rnd.dropped,
             "term_checks": len(rnd.questions) - len(model_kept),
             "depth": rnd.depth,
         })
@@ -274,16 +260,17 @@ def run_translate(session: core.CoachSession, record: dict) -> dict:
 
 def run_live(records: list[tuple[str, dict]], cfg: dict, model: str, samples: int, stages: list[str]) -> list[dict]:
     out = []
+    contexts = {c.key: c for c in core.list_contexts(cfg)}
     for name, record in records:
         entry: dict = {"record": name, "original_chars": len(record.get("original", ""))}
         print(f"== {name} ({entry['original_chars']} chars)", flush=True)
         try:
             if "understand" in stages:
-                entry["understand"] = run_understand(cfg, model, record, samples)
+                entry["understand"] = run_understand(cfg, model, record, samples, contexts)
                 for u in entry["understand"]:
                     print(f"  understand #{u['sample']}: {u['seconds']} s, {u['prompt_tokens']}/{u['output_tokens']} tok, "
                           f"restatement {u['restatement_lang']} (text {u['text_lang']}), kept {u['questions_kept']}, "
-                          f"choice dropped {u['dropped_as_choice']}, term checks {u['term_checks']}, depth {u['depth']}",
+                          f"dropped {u['questions_dropped']} {u['dropped_by_reason'] or ''}, term checks {u['term_checks']}, depth {u['depth']}",
                           flush=True)
             session = None
             if "build" in stages or "translate" in stages:
@@ -351,6 +338,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Live replay, model {model}, app {app_version()}, stages {','.join(stages)}\n")
         live = run_live(records, cfg, model, args.samples, stages)
+        calls = [u for e in live for u in e.get("understand", [])]
+        if calls:
+            totals: dict = {}
+            for u in calls:
+                for reason, n in u["dropped_by_reason"].items():
+                    totals[reason] = totals.get(reason, 0) + n
+            print(f"\nQuestion filter: {len(calls)} calls, kept {sum(u['questions_kept'] for u in calls)}, "
+                  f"dropped {sum(totals.values())} {dict(sorted(totals.items()))}")
         if not args.no_save:
             out_dir = ROOT / "history" / "replays"
             out_dir.mkdir(parents=True, exist_ok=True)
