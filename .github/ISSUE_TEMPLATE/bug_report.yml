@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in Prompt Coach does not work
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Prompt Coach version
+      description: The number in the file `VERSION`.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it was installed
+      options:
+        - ZIP
+        - git clone
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: The output of `python --version`.
+    validations:
+      required: true
+  - type: input
+    id: ollama
+    attributes:
+      label: Ollama version and model
+      description: For example "0.13, qwen3.5:9b".
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: checkboxes
+    id: private
+    attributes:
+      label: Private text
+      options:
+        - label: I removed private text (prompts, contexts, history) from this report.
+          required: true

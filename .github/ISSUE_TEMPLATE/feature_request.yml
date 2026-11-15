@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest a change
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve?
+    validations:
+      required: true
+  - type: textarea
+    id: wish
+    attributes:
+      label: What would you like?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false

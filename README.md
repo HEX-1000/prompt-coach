@@ -151,6 +151,8 @@ Questions and ideas go to [Discussions](https://github.com/HEX-1000/prompt-coach
 
 [Token Optimization System](https://github.com/HEX-1000/token-optimization-system): a local MCP server that gives Claude a few relevant sections of your files instead of whole documents.
 
+[Research Radar](https://github.com/HEX-1000/research-radar): a daily scan of new GitHub repositories, arXiv papers and Hugging Face models that keeps the few that fit your interests and writes a short note on each, with a local Ollama model.
+
 ## License
 
 [MIT](LICENSE). Made by [HEX-1000](https://github.com/HEX-1000).

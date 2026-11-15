@@ -3,3 +3,6 @@ contact_links:
   - name: Questions and ideas
     url: https://github.com/HEX-1000/prompt-coach/discussions/categories/q-a
     about: Ask about installing and using Prompt Coach, or suggest a change, in Discussions.
+  - name: Report a vulnerability privately
+    url: https://github.com/HEX-1000/prompt-coach/security/advisories/new
+    about: Do not open a public issue for a security problem. Use a private advisory.
