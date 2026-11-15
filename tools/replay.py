@@ -3,7 +3,7 @@
 python -B tools/replay.py --saved     score what the records already hold, no model
 python -B tools/replay.py             run the current pipeline on every record (needs Ollama)
 
-See docs/DESIGN-core.md, section 12. A replay never writes to history/*.json.
+A replay never writes to history/*.json.
 """
 from __future__ import annotations
 

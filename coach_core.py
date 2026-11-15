@@ -1,6 +1,6 @@
 """Core logic for the local prompt coach.
 
-One model call, then code builds the prompt (see docs/DESIGN-core.md):
+One model call, then code builds the prompt:
   understand: restate what the user means, ask up to a few questions, label the depth.
   build: the user's text unchanged, then the note, the answers, the questions left to
   the assistant and the glossary lines of the terms that occur. No model call.
@@ -61,7 +61,7 @@ CHARS_PER_TOKEN = 3.0
 OUTPUT_RESERVE = 1000  # tokens kept free for the model's answer
 MAX_TERM_CHECKS = 5
 
-# Translation (section 9 of docs/DESIGN-core.md)
+# Translation
 LANG_CODES = {"English": "en", "Turkish": "tr"}
 PART_LIMIT = 350        # characters per part
 BATCH_LIMIT = 4000      # source characters per model call

@@ -1,7 +1,6 @@
 """Pure text functions for Prompt Coach. Standard library only, no file or network access.
 
 Language guess, codes, glossary, prompt assembly, part splitting and translation checks.
-See docs/DESIGN-core.md, sections 6, 7 and 9.
 """
 from __future__ import annotations
 
